@@ -1,0 +1,18 @@
+# LecTrans Docker Compose
+version: '3.8'
+
+services:
+  lectrans:
+    build: .
+    container_name: lectrans
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./config:/root/.lectrans
+      - ./sessions:/root/.lectrans/sessions
+    env_file:
+      - .env
+    restart: unless-stopped
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_THEME_BASE=dark
