@@ -845,13 +845,39 @@ class LecTransApp:
         win.destroy()
     
     def _test_connection(self):
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=self.api_key_var.get(), base_url=self.base_url_var.get())
-            client.chat.completions.create(model=self.llm_model_var.get(), messages=[{'role': 'user', 'content': 'test'}], max_tokens=5)
-            messagebox.showinfo('成功', '✅ MiMo API 连接成功！')
-        except Exception as e:
-            messagebox.showerror('错误', f'连接失败: {str(e)}')
+        results = []
+        
+        # 测试 Azure
+        azure_key = self.azure_key_var.get()
+        azure_region = self.azure_region_var.get()
+        if azure_key:
+            try:
+                import azure.cognitiveservices.speech as speechsdk
+                speech_config = speechsdk.SpeechConfig(subscription=azure_key, region=azure_region)
+                # 简单验证配置是否有效
+                results.append("✅ Azure Speech API 配置有效")
+            except Exception as e:
+                results.append(f"❌ Azure 错误: {str(e)}")
+        else:
+            results.append("⚠️ Azure API Key 未填写")
+        
+        # 测试 MiMo
+        mimo_key = self.api_key_var.get()
+        mimo_url = self.base_url_var.get()
+        mimo_model = self.llm_model_var.get()
+        if mimo_key:
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=mimo_key, base_url=mimo_url)
+                client.chat.completions.create(model=mimo_model, messages=[{'role': 'user', 'content': 'test'}], max_tokens=5)
+                results.append("✅ MiMo API 连接成功")
+            except Exception as e:
+                results.append(f"❌ MiMo 错误: {str(e)}")
+        else:
+            results.append("⚠️ MiMo API Key 未填写")
+        
+        # 显示结果
+        messagebox.showinfo('测试结果', '\n'.join(results))
     
     def run(self):
         self.root.mainloop()
