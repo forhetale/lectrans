@@ -9,8 +9,6 @@ from typing import Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-import numpy as np
-
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True

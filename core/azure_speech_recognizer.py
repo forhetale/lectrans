@@ -11,8 +11,6 @@ from dataclasses import dataclass
 
 import azure.cognitiveservices.speech as speechsdk
 
-from .audio_capture import AudioChunk, audio_to_wav, merge_audio_chunks
-
 
 @dataclass
 class TranscriptionResult:
