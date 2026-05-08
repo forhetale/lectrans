@@ -18,14 +18,6 @@ from tkinter import ttk, messagebox, filedialog
 from typing import Optional, List
 import queue
 
-from dotenv import load_dotenv
-load_dotenv()
-
-# Azure 配置（从环境变量读取）
-AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
-AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "koreacentral")
-AZURE_LANGUAGE = "ko-KR"
-
 # 配置目录
 CONFIG_DIR = Path.home() / ".lectrans"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -70,9 +62,17 @@ class DesignSystem:
 
 class AppConfig:
     def __init__(self):
+        # Azure 配置
+        self.azure_key = ""
+        self.azure_region = "koreacentral"
+        self.azure_language = "ko-KR"
+        
+        # MiMo 配置
         self.api_key = ""
         self.base_url = "https://token-plan-cn.xiaomimimo.com/v1"
         self.llm_model = "mimo-v2.5-pro"
+        
+        # 其他配置
         self.font_size = 13
         self.audio_device_index = -1
         self.sample_rate = 16000
@@ -92,6 +92,9 @@ class AppConfig:
     def save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
+            'azure_key': self.azure_key,
+            'azure_region': self.azure_region,
+            'azure_language': self.azure_language,
             'api_key': self.api_key,
             'base_url': self.base_url,
             'llm_model': self.llm_model,
@@ -104,7 +107,7 @@ class AppConfig:
     
     @property
     def is_configured(self):
-        return bool(AZURE_SPEECH_KEY and AZURE_SPEECH_KEY != "your_azure_speech_key_here")
+        return bool(self.azure_key and self.api_key)
 
 
 class TranscriptEntry:
@@ -535,8 +538,12 @@ class LecTransApp:
     
     def init_components(self):
         """初始化组件"""
-        if not AZURE_SPEECH_KEY or AZURE_SPEECH_KEY == "your_azure_speech_key_here":
-            self.msg_queue.put(('error', '请在 .env 文件中配置 AZURE_SPEECH_KEY'))
+        if not self.config.azure_key:
+            self.msg_queue.put(('error', '请在设置中配置 Azure Speech API Key'))
+            return False
+        
+        if not self.config.api_key:
+            self.msg_queue.put(('error', '请在设置中配置 MiMo API Key'))
             return False
         
         try:
@@ -548,9 +555,9 @@ class LecTransApp:
             from core.azure_speech_recognizer import AzureSpeechRecognizer
             
             self.azure_recognizer = AzureSpeechRecognizer(
-                subscription_key=AZURE_SPEECH_KEY,
-                region=AZURE_SPEECH_REGION,
-                language=AZURE_LANGUAGE
+                subscription_key=self.config.azure_key,
+                region=self.config.azure_region,
+                language=self.config.azure_language
             )
             self.azure_recognizer.on_recognized = self._on_azure_recognized
             self.azure_recognizer.on_error = self._on_azure_error
@@ -738,34 +745,57 @@ class LecTransApp:
     def show_settings(self):
         win = Toplevel(self.root)
         win.title('设置')
-        win.geometry('450x400')
+        win.geometry('480x580')
         win.configure(bg=self.ds.COLORS['bg_primary'])
         win.transient(self.root)
         win.grab_set()
         
-        main = Frame(win, bg=self.ds.COLORS['bg_primary'])
+        # 创建可滚动的画布
+        canvas = Canvas(win, bg=self.ds.COLORS['bg_primary'], highlightthickness=0)
+        scrollbar = Scrollbar(win, orient=VERTICAL, command=canvas.yview)
+        scroll_frame = Frame(canvas, bg=self.ds.COLORS['bg_primary'])
+        
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        
+        main = Frame(scroll_frame, bg=self.ds.COLORS['bg_primary'])
         main.pack(fill=BOTH, expand=True, padx=24, pady=24)
         
         Label(main, text='⚙️ 设置', font=self.ds.FONTS['display'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_primary']).pack(anchor=W, pady=(0, 20))
         
-        # Azure 语音识别状态
+        # Azure 语音识别配置
         azure_card = Frame(main, bg=self.ds.COLORS['bg_secondary'], highlightthickness=1, highlightbackground=self.ds.COLORS['border'])
         azure_card.pack(fill=X, pady=(0, 16))
         
         azure_inner = Frame(azure_card, bg=self.ds.COLORS['bg_secondary'])
         azure_inner.pack(fill=X, padx=16, pady=16)
         
-        Label(azure_inner, text='🎤 Azure Speech API (语音识别)', font=self.ds.FONTS['heading'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(0, 8))
+        Label(azure_inner, text='🎤 Azure Speech API (语音识别)', font=self.ds.FONTS['heading'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(0, 12))
         
-        azure_status = "已配置" if (AZURE_SPEECH_KEY and AZURE_SPEECH_KEY != "your_azure_speech_key_here") else "未配置"
-        azure_color = self.ds.COLORS['success'] if azure_status == "已配置" else self.ds.COLORS['error']
+        Label(azure_inner, text='API Key', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        self.azure_key_var = StringVar(value=self.config.azure_key)
+        Entry(azure_inner, textvariable=self.azure_key_var, show='•', font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat').pack(fill=X, pady=(4, 12))
         
-        Label(azure_inner, text=f'状态: {azure_status}', font=self.ds.FONTS['body'], fg=azure_color, bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
-        Label(azure_inner, text=f'区域: {AZURE_SPEECH_REGION}', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
-        Label(azure_inner, text=f'语言: {AZURE_LANGUAGE} (韩语)', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        azure_config_frame = Frame(azure_inner, bg=self.ds.COLORS['bg_secondary'])
+        azure_config_frame.pack(fill=X)
         
-        if azure_status == "未配置":
-            Label(azure_inner, text='📌 请在 .env 文件中配置 AZURE_SPEECH_KEY', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['warning'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(8, 0))
+        f1 = Frame(azure_config_frame, bg=self.ds.COLORS['bg_secondary'])
+        f1.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        Label(f1, text='区域', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        self.azure_region_var = StringVar(value=self.config.azure_region)
+        ttk.Combobox(f1, textvariable=self.azure_region_var, values=['koreacentral', 'eastasia', 'southeastasia', 'westeurope', 'eastus'], state='readonly').pack(fill=X, pady=4)
+        
+        f2 = Frame(azure_config_frame, bg=self.ds.COLORS['bg_secondary'])
+        f2.pack(side=LEFT, fill=X, expand=True)
+        Label(f2, text='语言', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        self.azure_language_var = StringVar(value=self.config.azure_language)
+        ttk.Combobox(f2, textvariable=self.azure_language_var, values=['ko-KR', 'en-US', 'zh-CN', 'ja-JP'], state='readonly').pack(fill=X, pady=4)
+        
+        Label(azure_inner, text='📌 获取 Key: https://portal.azure.com', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(8, 0))
         
         # MiMo API 配置（翻译/总结）
         mimo_card = Frame(main, bg=self.ds.COLORS['bg_secondary'], highlightthickness=1, highlightbackground=self.ds.COLORS['border'])
@@ -788,19 +818,26 @@ class LecTransApp:
         self.llm_model_var = StringVar(value=self.config.llm_model)
         ttk.Combobox(mimo_inner, textvariable=self.llm_model_var, values=['mimo-v2.5-pro', 'mimo-v2.5'], state='readonly').pack(fill=X, pady=4)
         
-        Label(main, text='📌 获取 Key: https://mimo.xiaomi.com', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_primary']).pack(anchor=W, pady=(0, 16))
+        Label(mimo_inner, text='📌 获取 Key: https://mimo.xiaomi.com', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(8, 0))
         
         btn_frame = Frame(main, bg=self.ds.COLORS['bg_primary'])
-        btn_frame.pack(fill=X)
+        btn_frame.pack(fill=X, pady=(16, 0))
         
         Button(btn_frame, text='测试连接', font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_elevated'], fg=self.ds.COLORS['text_primary'], relief='flat', padx=12, pady=6, command=self._test_connection).pack(side=LEFT, padx=(0, 8))
         Button(btn_frame, text='保存', font=self.ds.FONTS['body_bold'], bg=self.ds.COLORS['accent'], fg='#FFFFFF', relief='flat', padx=16, pady=6, command=lambda: self._save_settings(win)).pack(side=LEFT)
         Button(btn_frame, text='取消', font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat', padx=12, pady=6, command=win.destroy).pack(side=RIGHT)
     
     def _save_settings(self, win):
+        # 保存 Azure 配置
+        self.config.azure_key = self.azure_key_var.get()
+        self.config.azure_region = self.azure_region_var.get()
+        self.config.azure_language = self.azure_language_var.get()
+        
+        # 保存 MiMo 配置
         self.config.api_key = self.api_key_var.get()
         self.config.base_url = self.base_url_var.get()
         self.config.llm_model = self.llm_model_var.get()
+        
         self.config.save()
         self.is_connected = False
         self.init_components()
