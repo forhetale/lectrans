@@ -6,8 +6,6 @@ from typing import Optional, AsyncGenerator, Generator
 from datetime import datetime
 from dataclasses import dataclass
 
-from openai import OpenAI
-
 
 @dataclass
 class TranslationResult:
@@ -38,6 +36,7 @@ class Translator:
         base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
         model: str = "mimo-v2.5-pro"
     ):
+        from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.history: list[dict] = []
@@ -153,6 +152,7 @@ class Summarizer:
         base_url: str = "https://token-plan-cn.xiaomimimo.com/v1",
         model: str = "mimo-v2.5-pro"
     ):
+        from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
     
