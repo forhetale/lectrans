@@ -352,7 +352,6 @@ class LecTransApp:
         
         Label(left_nav, text='🎓', font=('Segoe UI', 16), bg=self.ds.COLORS['bg_secondary']).pack(side=LEFT)
         Label(left_nav, text='LecTrans', font=('Segoe UI', 14, 'bold'), fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(side=LEFT, padx=(6, 0))
-        Label(left_nav, text='MiMo', font=self.ds.FONTS['small'], fg=self.ds.COLORS['accent'], bg=self.ds.COLORS['bg_secondary']).pack(side=LEFT, padx=(8, 0))
         
         right_nav = Frame(navbar, bg=self.ds.COLORS['bg_secondary'])
         right_nav.pack(side=RIGHT, padx=16)
