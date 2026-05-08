@@ -18,13 +18,31 @@ python -m pip install openai azure-cognitiveservices-speech pyaudio pyinstaller 
 echo.
 
 echo [2/3] Building exe...
+
+REM 获取 Azure Speech SDK 路径
+for /f "tokens=*" %%i in ('python -c "import azure.cognitiveservices.speech; import os; print(os.path.dirname(azure.cognitiveservices.speech.__file__))"') do set AZURE_SDK_PATH=%%i
+
+echo Azure SDK Path: %AZURE_SDK_PATH%
+
 python -m PyInstaller --onefile --windowed --name LecTrans ^
+    --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.core.dll;azure\cognitiveservices\speech" ^
+    --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.extension.audio.sys.dll;azure\cognitiveservices\speech" ^
+    --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.extension.codec.dll;azure\cognitiveservices\speech" ^
+    --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.extension.kws.dll;azure\cognitiveservices\speech" ^
+    --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.extension.kws.ort.dll;azure\cognitiveservices\speech" ^
     --hidden-import openai ^
     --hidden-import openai._client ^
     --hidden-import openai.resources ^
     --hidden-import openai.resources.chat ^
     --hidden-import openai.resources.chat.completions ^
     --hidden-import azure.cognitiveservices.speech ^
+    --hidden-import azure.cognitiveservices.speech.audio ^
+    --hidden-import azure.cognitiveservices.speech.speech ^
+    --hidden-import azure.cognitiveservices.speech.translation ^
+    --hidden-import azure.cognitiveservices.speech.transcription ^
+    --hidden-import azure.cognitiveservices.speech.enums ^
+    --hidden-import azure.cognitiveservices.speech.properties ^
+    --hidden-import azure.cognitiveservices.speech.interop ^
     --hidden-import pyaudio ^
     --hidden-import pyaudio._portaudio ^
     --hidden-import httpx ^
