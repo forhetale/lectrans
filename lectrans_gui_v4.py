@@ -1,6 +1,6 @@
 """
 LecTrans - Windows GUI 应用 v4
-修复：使用真实录音 + ASR API
+使用 Azure Speech API 进行语音识别
 """
 
 import os
@@ -17,6 +17,14 @@ from tkinter import *
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional, List
 import queue
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Azure 配置（从环境变量读取）
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "koreacentral")
+AZURE_LANGUAGE = "ko-KR"
 
 # 配置目录
 CONFIG_DIR = Path.home() / ".lectrans"
@@ -63,8 +71,7 @@ class DesignSystem:
 class AppConfig:
     def __init__(self):
         self.api_key = ""
-        self.base_url = "https://api.xiaomimimo.com/v1"
-        self.asr_model = "mimo-v2.5-asr"
+        self.base_url = "https://token-plan-cn.xiaomimimo.com/v1"
         self.llm_model = "mimo-v2.5-pro"
         self.font_size = 13
         self.audio_device_index = -1
@@ -87,7 +94,6 @@ class AppConfig:
         data = {
             'api_key': self.api_key,
             'base_url': self.base_url,
-            'asr_model': self.asr_model,
             'llm_model': self.llm_model,
             'font_size': self.font_size,
             'audio_device_index': self.audio_device_index,
@@ -98,7 +104,7 @@ class AppConfig:
     
     @property
     def is_configured(self):
-        return bool(self.api_key)
+        return bool(AZURE_SPEECH_KEY and AZURE_SPEECH_KEY != "your_azure_speech_key_here")
 
 
 class TranscriptEntry:
@@ -109,41 +115,13 @@ class TranscriptEntry:
 
 
 # ============================================================
-# MiMo API 客户端
+# MiMo API 客户端（翻译/总结）
 # ============================================================
 
 class MiMoClient:
     def __init__(self, api_key: str, base_url: str):
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
-    
-    def transcribe(self, audio_data: bytes, model: str = "mimo-v2.5-asr", sample_rate: int = 16000) -> str:
-        """语音识别 - 将音频转为文字"""
-        try:
-            # 转换为 WAV 格式
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_data)
-            
-            wav_buffer.seek(0)
-            wav_buffer.name = "audio.wav"
-            
-            # 调用 ASR API
-            response = self.client.audio.transcriptions.create(
-                file=wav_buffer,
-                model=model,
-                language="ko"  # 韩语
-            )
-            
-            text = response.text.strip() if response.text else ""
-            return text
-            
-        except Exception as e:
-            print(f"ASR error: {e}")
-            return ""
     
     def translate(self, korean_text: str, model: str = "mimo-v2.5-pro") -> str:
         """翻译韩语为中文"""
@@ -341,6 +319,7 @@ class LecTransApp:
         
         # 组件
         self.mimo_client: Optional[MiMoClient] = None
+        self.azure_recognizer = None
         self.audio_recorder: Optional[AudioRecorder] = None
         self.msg_queue = queue.Queue()
         
@@ -484,7 +463,7 @@ class LecTransApp:
         self.status_dot = Label(status_bar, text='●', fg=self.ds.COLORS['error'], bg=self.ds.COLORS['bg_secondary'], font=('Segoe UI', 8))
         self.status_dot.pack(side=LEFT, padx=(12, 4))
         
-        self.status_text = Label(status_bar, text='未连接', fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_secondary'], font=self.ds.FONTS['caption'])
+        self.status_text = Label(status_bar, text='ASR: Azure | 翻译: MiMo', fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_secondary'], font=self.ds.FONTS['caption'])
         self.status_text.pack(side=LEFT, padx=(0, 16))
         
         self.entry_count = Label(status_bar, text='0 entries', fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_secondary'], font=self.ds.FONTS['caption'])
@@ -555,8 +534,27 @@ class LecTransApp:
         self.root.after(100, self.process_queue)
     
     def init_components(self):
+        """初始化组件"""
+        if not AZURE_SPEECH_KEY or AZURE_SPEECH_KEY == "your_azure_speech_key_here":
+            self.msg_queue.put(('error', '请在 .env 文件中配置 AZURE_SPEECH_KEY'))
+            return False
+        
         try:
+            # MiMo客户端（翻译/总结）
             self.mimo_client = MiMoClient(self.config.api_key, self.config.base_url)
+            
+            # Azure语音识别器
+            sys.path.insert(0, str(Path(__file__).parent))
+            from core.azure_speech_recognizer import AzureSpeechRecognizer
+            
+            self.azure_recognizer = AzureSpeechRecognizer(
+                subscription_key=AZURE_SPEECH_KEY,
+                region=AZURE_SPEECH_REGION,
+                language=AZURE_LANGUAGE
+            )
+            self.azure_recognizer.on_recognized = self._on_azure_recognized
+            self.azure_recognizer.on_error = self._on_azure_error
+            
             self.is_connected = True
             self.msg_queue.put(('status', {'connected': True}))
             return True
@@ -575,38 +573,40 @@ class LecTransApp:
             if not self.init_components():
                 return
         
-        # 创建录音器
-        self.audio_recorder = AudioRecorder(
-            sample_rate=self.config.sample_rate,
-            device_index=self.config.audio_device_index
-        )
-        
-        if not self.audio_recorder.start():
-            messagebox.showerror('错误', '无法启动录音，请检查麦克风')
-            return
-        
-        self.is_recording = True
-        self.recording_start_time = datetime.now()
-        self.record_btn.configure(text='⏹ 停止录音', bg=self.ds.COLORS['error'], activebackground='#E53600')
-        
-        self._update_recording_time()
-        
-        # 启动处理线程
-        threading.Thread(target=self._processing_loop, daemon=True).start()
+        # 启动Azure连续识别
+        if self.azure_recognizer and self.azure_recognizer.start_continuous_recognition():
+            self.is_recording = True
+            self.recording_start_time = datetime.now()
+            self.record_btn.configure(text='⏹ 停止录音', bg=self.ds.COLORS['error'], activebackground='#E53600')
+            self._update_recording_time()
+        else:
+            messagebox.showerror('错误', '无法启动语音识别，请检查麦克风')
     
     def stop_recording(self):
         self.is_recording = False
         
-        if self.audio_recorder:
-            # 获取剩余音频数据并处理
-            audio_data = self.audio_recorder.stop()
-            if audio_data and len(audio_data) > self.config.sample_rate:  # 至少 1 秒
-                threading.Thread(target=self._process_audio, args=(audio_data,), daemon=True).start()
-            self.audio_recorder = None
+        if self.azure_recognizer:
+            self.azure_recognizer.stop_continuous_recognition()
         
         self.recording_start_time = None
         self.record_btn.configure(text='⏺ 开始录音', bg=self.ds.COLORS['success'], activebackground='#00B54D')
         self.recording_time_label.config(text='')
+    
+    def _on_azure_recognized(self, result):
+        """Azure识别结果回调"""
+        korean = result.text
+        if not korean or len(korean.strip()) < 2:
+            return
+        
+        # 翻译
+        chinese = self.mimo_client.translate(korean, self.config.llm_model)
+        
+        # 添加到界面
+        self.msg_queue.put(('transcript', {'korean': korean, 'chinese': chinese}))
+    
+    def _on_azure_error(self, error):
+        """Azure错误回调"""
+        self.msg_queue.put(('error', f'Azure错误: {error}'))
     
     def _update_recording_time(self):
         if self.is_recording and self.recording_start_time:
@@ -615,45 +615,6 @@ class LecTransApp:
             m, s = divmod(seconds, 60)
             self.recording_time_label.config(text=f'{m:02d}:{s:02d}')
             self.root.after(1000, self._update_recording_time)
-    
-    def _processing_loop(self):
-        """录音处理循环 - 每隔一段时间处理缓冲区的音频"""
-        while self.is_recording:
-            time.sleep(3)  # 每 3 秒处理一次
-            
-            if not self.is_recording or not self.audio_recorder:
-                break
-            
-            # 获取缓冲区数据
-            audio_data = self.audio_recorder.get_buffer()
-            
-            if audio_data and len(audio_data) > 0:
-                # 处理音频
-                self._process_audio(audio_data)
-    
-    def _process_audio(self, audio_data: bytes):
-        """处理音频数据：ASR -> 翻译"""
-        try:
-            # 1. 语音识别
-            self.msg_queue.put(('log', '正在识别...'))
-            korean = self.mimo_client.transcribe(
-                audio_data,
-                model=self.config.asr_model,
-                sample_rate=self.config.sample_rate
-            )
-            
-            if not korean or len(korean.strip()) < 2:
-                return  # 没有识别到有效内容
-            
-            # 2. 翻译
-            self.msg_queue.put(('log', '正在翻译...'))
-            chinese = self.mimo_client.translate(korean, self.config.llm_model)
-            
-            # 3. 添加到界面
-            self.msg_queue.put(('transcript', {'korean': korean, 'chinese': chinese}))
-            
-        except Exception as e:
-            print(f"Process audio error: {e}")
     
     def _add_transcript(self, korean: str, chinese: str):
         entry = TranscriptEntry(korean, chinese)
@@ -769,15 +730,15 @@ class LecTransApp:
         self.is_connected = connected
         if connected:
             self.status_dot.config(fg=self.ds.COLORS['success'])
-            self.status_text.config(text='已连接')
+            self.status_text.config(text='ASR: Azure | 翻译: MiMo')
         else:
             self.status_dot.config(fg=self.ds.COLORS['error'])
-            self.status_text.config(text='未连接')
+            self.status_text.config(text='ASR: Azure | 翻译: 未连接')
     
     def show_settings(self):
         win = Toplevel(self.root)
         win.title('设置')
-        win.geometry('450x480')
+        win.geometry('450x400')
         win.configure(bg=self.ds.COLORS['bg_primary'])
         win.transient(self.root)
         win.grab_set()
@@ -787,36 +748,45 @@ class LecTransApp:
         
         Label(main, text='⚙️ 设置', font=self.ds.FONTS['display'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_primary']).pack(anchor=W, pady=(0, 20))
         
-        card = Frame(main, bg=self.ds.COLORS['bg_secondary'], highlightthickness=1, highlightbackground=self.ds.COLORS['border'])
-        card.pack(fill=X, pady=(0, 16))
+        # Azure 语音识别状态
+        azure_card = Frame(main, bg=self.ds.COLORS['bg_secondary'], highlightthickness=1, highlightbackground=self.ds.COLORS['border'])
+        azure_card.pack(fill=X, pady=(0, 16))
         
-        inner = Frame(card, bg=self.ds.COLORS['bg_secondary'])
-        inner.pack(fill=X, padx=16, pady=16)
+        azure_inner = Frame(azure_card, bg=self.ds.COLORS['bg_secondary'])
+        azure_inner.pack(fill=X, padx=16, pady=16)
         
-        Label(inner, text='🔑 MiMo API', font=self.ds.FONTS['heading'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(0, 12))
+        Label(azure_inner, text='🎤 Azure Speech API (语音识别)', font=self.ds.FONTS['heading'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(0, 8))
         
-        Label(inner, text='API Key', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        azure_status = "已配置" if (AZURE_SPEECH_KEY and AZURE_SPEECH_KEY != "your_azure_speech_key_here") else "未配置"
+        azure_color = self.ds.COLORS['success'] if azure_status == "已配置" else self.ds.COLORS['error']
+        
+        Label(azure_inner, text=f'状态: {azure_status}', font=self.ds.FONTS['body'], fg=azure_color, bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        Label(azure_inner, text=f'区域: {AZURE_SPEECH_REGION}', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        Label(azure_inner, text=f'语言: {AZURE_LANGUAGE} (韩语)', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        
+        if azure_status == "未配置":
+            Label(azure_inner, text='📌 请在 .env 文件中配置 AZURE_SPEECH_KEY', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['warning'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(8, 0))
+        
+        # MiMo API 配置（翻译/总结）
+        mimo_card = Frame(main, bg=self.ds.COLORS['bg_secondary'], highlightthickness=1, highlightbackground=self.ds.COLORS['border'])
+        mimo_card.pack(fill=X, pady=(0, 16))
+        
+        mimo_inner = Frame(mimo_card, bg=self.ds.COLORS['bg_secondary'])
+        mimo_inner.pack(fill=X, padx=16, pady=16)
+        
+        Label(mimo_inner, text='🌐 MiMo API (翻译/总结)', font=self.ds.FONTS['heading'], fg=self.ds.COLORS['text_primary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W, pady=(0, 12))
+        
+        Label(mimo_inner, text='API Key', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
         self.api_key_var = StringVar(value=self.config.api_key)
-        Entry(inner, textvariable=self.api_key_var, show='•', font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat').pack(fill=X, pady=(4, 12))
+        Entry(mimo_inner, textvariable=self.api_key_var, show='•', font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat').pack(fill=X, pady=(4, 12))
         
-        Label(inner, text='Base URL', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        Label(mimo_inner, text='Base URL', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
         self.base_url_var = StringVar(value=self.config.base_url)
-        Entry(inner, textvariable=self.base_url_var, font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat').pack(fill=X, pady=(4, 12))
+        Entry(mimo_inner, textvariable=self.base_url_var, font=self.ds.FONTS['body'], bg=self.ds.COLORS['bg_tertiary'], fg=self.ds.COLORS['text_primary'], relief='flat').pack(fill=X, pady=(4, 12))
         
-        model_frame = Frame(inner, bg=self.ds.COLORS['bg_secondary'])
-        model_frame.pack(fill=X)
-        
-        f1 = Frame(model_frame, bg=self.ds.COLORS['bg_secondary'])
-        f1.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-        Label(f1, text='语音识别', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
-        self.asr_model_var = StringVar(value=self.config.asr_model)
-        ttk.Combobox(f1, textvariable=self.asr_model_var, values=['mimo-v2.5-asr'], state='readonly').pack(fill=X, pady=4)
-        
-        f2 = Frame(model_frame, bg=self.ds.COLORS['bg_secondary'])
-        f2.pack(side=LEFT, fill=X, expand=True)
-        Label(f2, text='翻译/总结', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
+        Label(mimo_inner, text='翻译模型', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_secondary'], bg=self.ds.COLORS['bg_secondary']).pack(anchor=W)
         self.llm_model_var = StringVar(value=self.config.llm_model)
-        ttk.Combobox(f2, textvariable=self.llm_model_var, values=['mimo-v2.5-pro', 'mimo-v2.5'], state='readonly').pack(fill=X, pady=4)
+        ttk.Combobox(mimo_inner, textvariable=self.llm_model_var, values=['mimo-v2.5-pro', 'mimo-v2.5'], state='readonly').pack(fill=X, pady=4)
         
         Label(main, text='📌 获取 Key: https://mimo.xiaomi.com', font=self.ds.FONTS['caption'], fg=self.ds.COLORS['text_muted'], bg=self.ds.COLORS['bg_primary']).pack(anchor=W, pady=(0, 16))
         
@@ -830,7 +800,6 @@ class LecTransApp:
     def _save_settings(self, win):
         self.config.api_key = self.api_key_var.get()
         self.config.base_url = self.base_url_var.get()
-        self.config.asr_model = self.asr_model_var.get()
         self.config.llm_model = self.llm_model_var.get()
         self.config.save()
         self.is_connected = False
@@ -843,7 +812,7 @@ class LecTransApp:
             from openai import OpenAI
             client = OpenAI(api_key=self.api_key_var.get(), base_url=self.base_url_var.get())
             client.chat.completions.create(model=self.llm_model_var.get(), messages=[{'role': 'user', 'content': 'test'}], max_tokens=5)
-            messagebox.showinfo('成功', '✅ 连接成功！')
+            messagebox.showinfo('成功', '✅ MiMo API 连接成功！')
         except Exception as e:
             messagebox.showerror('错误', f'连接失败: {str(e)}')
     

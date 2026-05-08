@@ -17,9 +17,15 @@ load_dotenv()
 class APIConfig:
     """API 配置"""
     # ASR 配置
-    asr_provider: str = "groq"  # groq, openai, local
+    asr_provider: str = "groq"  # groq, openai, azure, local
     asr_api_key: str = ""
     asr_model: str = "whisper-large-v3-turbo"
+    
+    # Azure配置
+    azure_subscription_key: str = ""
+    azure_region: str = "koreacentral"
+    azure_endpoint: str = ""
+    azure_language: str = "ko-KR"
     
     # LLM 配置
     llm_provider: str = "xiaomi"  # xiaomi, deepseek, openai, groq, local
@@ -32,6 +38,11 @@ class APIConfig:
         self.asr_api_key = self.asr_api_key or os.getenv("GROQ_API_KEY", "")
         self.llm_api_key = self.llm_api_key or os.getenv("XIAOMI_API_KEY", "")
         
+        # Azure配置
+        self.azure_subscription_key = self.azure_subscription_key or os.getenv("AZURE_SPEECH_KEY", "")
+        self.azure_region = self.azure_region or os.getenv("AZURE_SPEECH_REGION", "koreacentral")
+        self.azure_endpoint = self.azure_endpoint or os.getenv("AZURE_SPEECH_ENDPOINT", "")
+        
         # 根据 provider 自动设置 base_url
         if not self.llm_base_url:
             if self.llm_provider == "xiaomi":
@@ -42,6 +53,8 @@ class APIConfig:
     @property
     def is_configured(self) -> bool:
         """检查是否已配置"""
+        if self.asr_provider == "azure":
+            return bool(self.azure_subscription_key)
         return bool(self.asr_api_key and self.llm_api_key)
 
 
@@ -90,6 +103,13 @@ class AppConfig:
                 self.api.llm_base_url = api_data.get('llm_base_url', self.api.llm_base_url)
                 self.api.llm_model = api_data.get('llm_model', self.api.llm_model)
                 
+                # Azure配置
+                azure_data = api_data.get('azure', {})
+                self.api.azure_subscription_key = azure_data.get('subscription_key', self.api.azure_subscription_key)
+                self.api.azure_region = azure_data.get('region', self.api.azure_region)
+                self.api.azure_endpoint = azure_data.get('endpoint', self.api.azure_endpoint)
+                self.api.azure_language = azure_data.get('language', self.api.azure_language)
+                
                 # UI 配置
                 ui_data = data.get('ui', {})
                 self.ui.theme = ui_data.get('theme', self.ui.theme)
@@ -103,6 +123,12 @@ class AppConfig:
             'api': {
                 'asr_provider': self.api.asr_provider,
                 'asr_api_key': self.api.asr_api_key,
+                'azure': {
+                    'subscription_key': self.api.azure_subscription_key,
+                    'region': self.api.azure_region,
+                    'endpoint': self.api.azure_endpoint,
+                    'language': self.api.azure_language,
+                },
                 'llm_provider': self.api.llm_provider,
                 'llm_api_key': self.api.llm_api_key,
                 'llm_base_url': self.api.llm_base_url,
