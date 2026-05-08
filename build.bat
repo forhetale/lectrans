@@ -1,7 +1,7 @@
 @echo off
 echo.
 echo ==========================================
-echo    LecTrans Build Tool v5
+echo    LecTrans Build Tool v6
 echo    Azure Speech + MiMo
 echo ==========================================
 echo.
@@ -32,9 +32,31 @@ python -m PyInstaller --onefile --windowed --name LecTrans ^
     --add-binary "%AZURE_SDK_PATH%\Microsoft.CognitiveServices.Speech.extension.kws.ort.dll;azure\cognitiveservices\speech" ^
     --hidden-import openai ^
     --hidden-import openai._client ^
+    --hidden-import openai._base_client ^
+    --hidden-import openai._exceptions ^
+    --hidden-import openai._models ^
+    --hidden-import openai._qs ^
+    --hidden-import openai._utils ^
+    --hidden-import openai.lib ^
+    --hidden-import openai.lib._parsing ^
+    --hidden-import openai.lib._completers ^
+    --hidden-import openai.lib._responses ^
+    --hidden-import openai.lib._streaming ^
+    --hidden-import openai.lib._tool_converters ^
+    --hidden-import openai.lib._pydantic ^
     --hidden-import openai.resources ^
+    --hidden-import openai.resources.audio ^
     --hidden-import openai.resources.chat ^
     --hidden-import openai.resources.chat.completions ^
+    --hidden-import openai.resources.audio.transcriptions ^
+    --hidden-import openai.resources.completions ^
+    --hidden-import openai.resources.embeddings ^
+    --hidden-import openai.types ^
+    --hidden-import openai.types.chat ^
+    --hidden-import openai.types.chat.chat_completion ^
+    --hidden-import openai.types.chat.chat_completion_chunk ^
+    --hidden-import openai.types.audio ^
+    --hidden-import openai.types.audio.transcription ^
     --hidden-import azure.cognitiveservices.speech ^
     --hidden-import azure.cognitiveservices.speech.audio ^
     --hidden-import azure.cognitiveservices.speech.speech ^
@@ -53,6 +75,13 @@ python -m PyInstaller --onefile --windowed --name LecTrans ^
     --hidden-import distro ^
     --hidden-import jiter ^
     --hidden-import h11 ^
+    --hidden-import httpcore ^
+    --hidden-import httpcore._sync ^
+    --hidden-import httpcore._async ^
+    --hidden-import httpcore._sync.http_proxy ^
+    --hidden-import httpcore._sync.socks_proxy ^
+    --hidden-import httpcore._async.http_proxy ^
+    --hidden-import httpcore._async.socks_proxy ^
     --hidden-import tkinter ^
     --hidden-import tkinter.ttk ^
     --exclude-module numpy ^
