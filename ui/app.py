@@ -48,7 +48,7 @@ class LecTransApp:
 
         # 组件
         self.mimo_client: Optional[MiMoClient] = None
-        self.azure_recognizer = None
+        self.recognizer = None
         self.audio_recorder: Optional[AudioRecorder] = None
         self.msg_queue = queue.Queue()
 
@@ -304,8 +304,8 @@ class LecTransApp:
     # ==============================================================
 
     def _init_components(self) -> bool:
-        """初始化 Azure 识别器和 MiMo 客户端"""
-        if not self.config.azure_key:
+        """初始化语音识别器和 MiMo 客户端"""
+        if self.config.asr_engine == "azure" and not self.config.azure_key:
             self.msg_queue.put(('error', '请在设置中配置 Azure Speech API Key'))
             return False
         if not self.config.api_key:
@@ -315,14 +315,24 @@ class LecTransApp:
         try:
             self.mimo_client = MiMoClient(self.config.api_key, self.config.base_url)
 
-            from core.azure_recognizer import AzureSpeechRecognizer
-            self.azure_recognizer = AzureSpeechRecognizer(
-                subscription_key=self.config.azure_key,
-                region=self.config.azure_region,
-                language=self.config.azure_language,
-            )
-            self.azure_recognizer.on_recognized = self._on_azure_recognized
-            self.azure_recognizer.on_error = self._on_azure_error
+            if self.config.asr_engine == "azure":
+                from core.azure_recognizer import AzureSpeechRecognizer
+                self.recognizer = AzureSpeechRecognizer(
+                    subscription_key=self.config.azure_key,
+                    region=self.config.azure_region,
+                    language=self.config.azure_language,
+                )
+            else:
+                from core.local_recognizer import LocalWhisperRecognizer
+                # 默认只传 ko 因为目前软件固定处理韩语
+                self.recognizer = LocalWhisperRecognizer(
+                    model_size=self.config.whisper_model,
+                    device_index=self.config.audio_device_index,
+                    sample_rate=self.config.sample_rate,
+                )
+                
+            self.recognizer.on_recognized = self._on_recognized
+            self.recognizer.on_error = self._on_error
 
             self.is_connected = True
             self.msg_queue.put(('status', {'connected': True}))
@@ -346,7 +356,7 @@ class LecTransApp:
             if not self._init_components():
                 return
 
-        if self.azure_recognizer and self.azure_recognizer.start_continuous_recognition():
+        if self.recognizer and self.recognizer.start_continuous_recognition():
             self.is_recording = True
             self.recording_start_time = datetime.now()
             self.session_id = self.recording_start_time.strftime("%Y%m%d_%H%M%S")
@@ -374,8 +384,8 @@ class LecTransApp:
     def _stop_recording(self):
         self.is_recording = False
 
-        if self.azure_recognizer:
-            self.azure_recognizer.stop_continuous_recognition()
+        if self.recognizer:
+            self.recognizer.stop_continuous_recognition()
 
         # 停止录音并获取音频数据
         audio_data = b''
@@ -419,19 +429,19 @@ class LecTransApp:
         self.recording_start_time = None
 
     # ==============================================================
-    # Azure 回调
+    # 回调
     # ==============================================================
 
-    def _on_azure_recognized(self, result):
-        """Azure 识别结果回调（运行在后台线程）"""
+    def _on_recognized(self, result):
+        """识别结果回调（运行在后台线程）"""
         korean = result.text
         if not korean or len(korean.strip()) < 2:
             return
         chinese = self.mimo_client.translate(korean, self.config.llm_model)
         self.msg_queue.put(('transcript', {'korean': korean, 'chinese': chinese}))
 
-    def _on_azure_error(self, error):
-        self.msg_queue.put(('error', f'Azure错误: {error}'))
+    def _on_error(self, error):
+        self.msg_queue.put(('error', f'识别错误: {error}'))
 
     # ==============================================================
     # 转录显示

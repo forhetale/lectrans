@@ -18,6 +18,10 @@ class AppConfig:
     """应用配置"""
 
     def __init__(self):
+        # 语音识别引擎选择: "local" 或 "azure"
+        self.asr_engine = "local"
+        self.whisper_model = "base"
+
         # Azure 语音识别
         self.azure_key = ""
         self.azure_region = "koreacentral"
@@ -54,6 +58,8 @@ class AppConfig:
         """保存配置到 JSON 文件"""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
+            'asr_engine': self.asr_engine,
+            'whisper_model': self.whisper_model,
             'azure_key': self.azure_key,
             'azure_region': self.azure_region,
             'azure_language': self.azure_language,
@@ -70,4 +76,7 @@ class AppConfig:
     @property
     def is_configured(self):
         """检查是否已配置必要的 API Key"""
-        return bool(self.azure_key and self.api_key)
+        if self.asr_engine == "azure":
+            return bool(self.azure_key and self.api_key)
+        else:
+            return bool(self.api_key)

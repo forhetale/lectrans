@@ -60,8 +60,8 @@ class SettingsDialog:
         self.ds.make_label(main, '配置语音识别与翻译服务',
                            style='muted').pack(anchor=W, pady=(0, 24))
 
-        # ---- Azure 语音识别卡片 ----
-        self._build_azure_card(main)
+        # ---- 语音识别配置卡片 ----
+        self._build_asr_card(main)
 
         # ---- MiMo API 卡片 ----
         self._build_mimo_card(main)
@@ -77,8 +77,8 @@ class SettingsDialog:
         self.ds.make_button(btn_frame, '测试连接', self._test_connection,
                             style='secondary').pack(side=RIGHT)
 
-    def _build_azure_card(self, parent):
-        """Azure 语音识别配置卡片"""
+    def _build_asr_card(self, parent):
+        """语音识别配置卡片"""
         c = self.ds.COLORS
 
         card = self.ds.make_card(parent)
@@ -92,12 +92,18 @@ class SettingsDialog:
         title_row.pack(fill=X, pady=(0, 16))
         Label(title_row, text='●', font=('Segoe UI', 8),
               fg=c['accent'], bg=c['bg_secondary']).pack(side=LEFT, padx=(0, 8))
-        self.ds.make_label(title_row, 'Azure Speech API', style='heading',
+        self.ds.make_label(title_row, '语音识别引擎 (ASR)', style='heading',
                            bg=c['bg_secondary']).pack(side=LEFT)
-        self.ds.make_label(title_row, '语音识别', style='caption',
-                           bg=c['bg_secondary']).pack(side=LEFT, padx=(8, 0))
 
-        # API Key
+        # 引擎选择
+        self.ds.make_label(inner, '引擎选择', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+        self.asr_engine_var = StringVar(value=self.config.asr_engine)
+        ttk.Combobox(inner, textvariable=self.asr_engine_var,
+                     values=['local', 'azure'],
+                     state='readonly').pack(fill=X, ipady=2, pady=(0, 14))
+
+        # ---------------- Azure ----------------
+        self.ds.make_label(inner, '—— Azure 云端配置 ——', style='small', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.ds.make_label(inner, 'API Key', style='caption',
                            bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.azure_key_var = StringVar(value=self.config.azure_key)
@@ -105,7 +111,7 @@ class SettingsDialog:
 
         # 区域 + 语言（横排）
         row = Frame(inner, bg=c['bg_secondary'])
-        row.pack(fill=X)
+        row.pack(fill=X, pady=(0, 14))
 
         f1 = Frame(row, bg=c['bg_secondary'])
         f1.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
@@ -125,9 +131,13 @@ class SettingsDialog:
                      values=['ko-KR', 'en-US', 'zh-CN', 'ja-JP'],
                      state='readonly').pack(fill=X, ipady=2)
 
-        # 提示
-        self.ds.make_label(inner, '获取 Key → portal.azure.com', style='small',
-                           bg=c['bg_secondary']).pack(anchor=W, pady=(12, 0))
+        # ---------------- Local Whisper ----------------
+        self.ds.make_label(inner, '—— 本地 Whisper 配置 ——', style='small', bg=c['bg_secondary']).pack(anchor=W, pady=(8, 4))
+        self.ds.make_label(inner, '模型规模 (推荐 base/small)', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+        self.whisper_model_var = StringVar(value=self.config.whisper_model)
+        ttk.Combobox(inner, textvariable=self.whisper_model_var,
+                     values=['tiny', 'base', 'small', 'medium', 'large-v3'],
+                     state='readonly').pack(fill=X, ipady=2)
 
     def _build_mimo_card(self, parent):
         """MiMo 翻译 API 配置卡片"""
@@ -174,6 +184,8 @@ class SettingsDialog:
                            bg=c['bg_secondary']).pack(anchor=W, pady=(12, 0))
 
     def _save(self):
+        self.config.asr_engine = self.asr_engine_var.get()
+        self.config.whisper_model = self.whisper_model_var.get()
         self.config.azure_key = self.azure_key_var.get()
         self.config.azure_region = self.azure_region_var.get()
         self.config.azure_language = self.azure_language_var.get()
@@ -191,17 +203,25 @@ class SettingsDialog:
     def _test_connection(self):
         results = []
 
-        azure_key = self.azure_key_var.get()
-        azure_region = self.azure_region_var.get()
-        if azure_key:
-            try:
-                import azure.cognitiveservices.speech as speechsdk
-                speechsdk.SpeechConfig(subscription=azure_key, region=azure_region)
-                results.append("✅ Azure Speech API 配置有效")
-            except Exception as e:
-                results.append(f"❌ Azure 错误: {str(e)}")
+        asr_engine = self.asr_engine_var.get()
+        if asr_engine == "azure":
+            azure_key = self.azure_key_var.get()
+            azure_region = self.azure_region_var.get()
+            if azure_key:
+                try:
+                    import azure.cognitiveservices.speech as speechsdk
+                    speechsdk.SpeechConfig(subscription=azure_key, region=azure_region)
+                    results.append("✅ Azure Speech API 配置有效")
+                except Exception as e:
+                    results.append(f"❌ Azure 错误: {str(e)}")
+            else:
+                results.append("⚠️ Azure API Key 未填写")
         else:
-            results.append("⚠️ Azure API Key 未填写")
+            try:
+                import faster_whisper
+                results.append("✅ Faster-Whisper 环境已安装就绪")
+            except ImportError:
+                results.append("❌ Faster-Whisper 尚未安装，请通过 pip 安装")
 
         mimo_key = self.api_key_var.get()
         mimo_url = self.base_url_var.get()
