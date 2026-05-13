@@ -1,232 +1,155 @@
 """
 LecTrans 会话管理模块
+支持自动保存、历史浏览、录音文件关联
 """
 
-from typing import List, Optional
-from datetime import datetime
-from dataclasses import dataclass, field
-from pathlib import Path
 import json
-import yaml
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from config import SESSIONS_DIR, RECORDINGS_DIR
 
 
-@dataclass
 class TranscriptEntry:
-    """转录条目"""
-    id: int
-    timestamp: datetime
-    korean_text: str
-    chinese_text: str
-    
+    """单条转录记录"""
+
+    def __init__(self, korean: str, chinese: str, timestamp: datetime = None):
+        self.timestamp = timestamp or datetime.now()
+        self.korean = korean
+        self.chinese = chinese
+
     def to_dict(self) -> dict:
         return {
-            "id": self.id,
             "timestamp": self.timestamp.isoformat(),
-            "korean": self.korean_text,
-            "chinese": self.chinese_text
+            "korean": self.korean,
+            "chinese": self.chinese,
         }
 
-
-@dataclass
-class SessionState:
-    """会话状态"""
-    session_id: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    
-    # 转录记录
-    transcripts: List[TranscriptEntry] = field(default_factory=list)
-    
-    # 总结
-    summary: Optional[str] = None
-    
-    # 状态标志
-    is_recording: bool = False
-    is_connected: bool = False
-    
-    # 统计
-    total_entries: int = 0
-    total_duration: float = 0.0  # 秒
-    
-    def add_transcript(self, korean: str, chinese: str) -> TranscriptEntry:
-        """添加转录条目"""
-        entry = TranscriptEntry(
-            id=len(self.transcripts) + 1,
-            timestamp=datetime.now(),
-            korean_text=korean,
-            chinese_text=chinese
+    @classmethod
+    def from_dict(cls, data: dict) -> "TranscriptEntry":
+        return cls(
+            korean=data["korean"],
+            chinese=data["chinese"],
+            timestamp=datetime.fromisoformat(data["timestamp"]),
         )
-        self.transcripts.append(entry)
-        self.total_entries = len(self.transcripts)
-        return entry
-    
-    def get_full_transcript(self) -> str:
-        """获取完整转录文本"""
-        lines = []
-        for entry in self.transcripts:
-            lines.append(f"[{entry.timestamp.strftime('%H:%M:%S')}] {entry.korean_text}")
-        return "\n".join(lines)
-    
-    def get_bilingual_transcript(self) -> str:
-        """获取双语转录文本"""
-        lines = []
-        for entry in self.transcripts:
-            lines.append(f"[{entry.timestamp.strftime('%H:%M:%S')}]")
-            lines.append(f"韩: {entry.korean_text}")
-            lines.append(f"中: {entry.chinese_text}")
-            lines.append("")
-        return "\n".join(lines)
 
 
 class SessionManager:
     """会话管理器"""
-    
-    def __init__(self, storage_dir: str = None):
-        self.storage_dir = Path(storage_dir or Path.home() / ".lectrans" / "sessions")
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.current_session: Optional[SessionState] = None
-    
-    def start_session(self) -> SessionState:
-        """开始新会话"""
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        self.current_session = SessionState(
-            session_id=session_id,
-            start_time=datetime.now()
-        )
-        
-        return self.current_session
-    
-    def end_session(self):
-        """结束当前会话"""
-        if self.current_session:
-            self.current_session.end_time = datetime.now()
-            
-            # 计算总时长
-            if self.current_session.end_time and self.current_session.start_time:
-                delta = self.current_session.end_time - self.current_session.start_time
-                self.current_session.total_duration = delta.total_seconds()
-    
-    def save_session(self, filepath: str = None) -> str:
-        """保存会话"""
-        if not self.current_session:
-            raise ValueError("No active session")
-        
-        # 确定文件路径
-        if filepath:
-            save_path = Path(filepath)
-        else:
-            save_path = self.storage_dir / f"session_{self.current_session.session_id}.yaml"
-        
-        # 构建数据
+
+    def __init__(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # -------------------- 保存 --------------------
+
+    def save_session(
+        self,
+        session_id: str,
+        transcripts: List[TranscriptEntry],
+        summary: str = "",
+        recording_path: str = "",
+        start_time: datetime = None,
+        end_time: datetime = None,
+    ) -> str:
+        """保存会话到 JSON 文件，返回文件路径"""
+        filepath = SESSIONS_DIR / f"{session_id}.json"
         data = {
-            "session_id": self.current_session.session_id,
-            "start_time": self.current_session.start_time.isoformat(),
-            "end_time": self.current_session.end_time.isoformat() if self.current_session.end_time else None,
-            "total_entries": self.current_session.total_entries,
-            "total_duration": self.current_session.total_duration,
-            "transcripts": [t.to_dict() for t in self.current_session.transcripts],
-            "summary": self.current_session.summary
+            "session_id": session_id,
+            "start_time": start_time.isoformat() if start_time else "",
+            "end_time": end_time.isoformat() if end_time else "",
+            "total_entries": len(transcripts),
+            "recording_path": recording_path,
+            "summary": summary,
+            "transcripts": [t.to_dict() for t in transcripts],
         }
-        
-        # 保存
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, 'w', encoding='utf-8') as f:
-            yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
-        
-        return str(save_path)
-    
-    def load_session(self, filepath: str) -> SessionState:
-        """加载会话"""
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-        
-        # 创建会话
-        session = SessionState(
-            session_id=data['session_id'],
-            start_time=datetime.fromisoformat(data['start_time']),
-            end_time=datetime.fromisoformat(data['end_time']) if data.get('end_time') else None,
-            total_entries=data.get('total_entries', 0),
-            total_duration=data.get('total_duration', 0),
-            summary=data.get('summary')
-        )
-        
-        # 加载转录记录
-        for t in data.get('transcripts', []):
-            entry = TranscriptEntry(
-                id=t['id'],
-                timestamp=datetime.fromisoformat(t['timestamp']),
-                korean_text=t['korean'],
-                chinese_text=t['chinese']
-            )
-            session.transcripts.append(entry)
-        
-        return session
-    
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return str(filepath)
+
+    # -------------------- 查询 --------------------
+
     def list_sessions(self) -> List[dict]:
-        """列出所有会话"""
+        """列出所有历史会话（摘要信息），按时间倒序"""
         sessions = []
-        
-        for filepath in sorted(self.storage_dir.glob("session_*.yaml")):
+        for fp in SESSIONS_DIR.glob("*.json"):
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f)
-                
+                with open(fp, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
                 sessions.append({
-                    "session_id": data['session_id'],
-                    "start_time": data['start_time'],
-                    "total_entries": data.get('total_entries', 0),
-                    "filepath": str(filepath)
+                    "session_id": data["session_id"],
+                    "start_time": data.get("start_time", ""),
+                    "total_entries": data.get("total_entries", 0),
+                    "recording_path": data.get("recording_path", ""),
+                    "filepath": str(fp),
                 })
             except Exception:
                 continue
-        
+        sessions.sort(key=lambda s: s["start_time"], reverse=True)
         return sessions
-    
-    def export_markdown(self, filepath: str = None) -> str:
-        """导出为 Markdown"""
-        if not self.current_session:
-            raise ValueError("No active session")
-        
-        session = self.current_session
-        
-        # 构建 Markdown
+
+    def load_session(self, session_id: str) -> Optional[dict]:
+        """加载会话完整数据"""
+        filepath = SESSIONS_DIR / f"{session_id}.json"
+        if not filepath.exists():
+            return None
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def delete_session(self, session_id: str):
+        """删除会话及关联录音"""
+        filepath = SESSIONS_DIR / f"{session_id}.json"
+
+        # 删除关联录音
+        if filepath.exists():
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                rec_path = data.get("recording_path", "")
+                if rec_path:
+                    p = Path(rec_path)
+                    if p.exists():
+                        p.unlink()
+            except Exception:
+                pass
+            filepath.unlink()
+
+    # -------------------- 导出 --------------------
+
+    def export_markdown(self, session_id: str, output_path: str = None) -> str:
+        """导出会话为 Markdown 文本"""
+        data = self.load_session(session_id)
+        if not data:
+            return ""
+
         lines = [
-            f"# LecTrans 课堂笔记",
-            f"",
-            f"**日期**: {session.start_time.strftime('%Y-%m-%d %H:%M')}",
-            f"**时长**: {session.total_duration / 60:.1f} 分钟",
-            f"**条目**: {session.total_entries} 条",
-            f"",
-            f"---",
-            f"",
-            f"## 📝 转录内容",
-            f""
+            "# LecTrans 课堂笔记\n",
+            f"**日期**: {data.get('start_time', '未知')}\n",
+            "---\n",
         ]
-        
-        for entry in session.transcripts:
-            lines.append(f"### [{entry.timestamp.strftime('%H:%M:%S')}]")
-            lines.append(f"")
-            lines.append(f"**🇰🇷 한국어**: {entry.korean_text}")
-            lines.append(f"")
-            lines.append(f"**🇨🇳 中文**: {entry.chinese_text}")
-            lines.append(f"")
-            lines.append(f"---")
-            lines.append(f"")
-        
-        if session.summary:
-            lines.append(f"## 📚 课堂总结")
-            lines.append(f"")
-            lines.append(session.summary)
-        
+        for t in data.get("transcripts", []):
+            ts = t.get("timestamp", "")
+            if ts:
+                try:
+                    ts = datetime.fromisoformat(ts).strftime("%H:%M:%S")
+                except Exception:
+                    pass
+            lines.append(f"### [{ts}]")
+            lines.append(f"**韩语**: {t['korean']}\n")
+            lines.append(f"**中文**: {t['chinese']}\n")
+            lines.append("---\n")
+
+        summary = data.get("summary", "")
+        if summary:
+            lines.append(f"\n## 总结\n\n{summary}")
+
         markdown = "\n".join(lines)
-        
-        # 保存到文件
-        if filepath:
-            save_path = Path(filepath)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, 'w', encoding='utf-8') as f:
+
+        if output_path:
+            p = Path(output_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
                 f.write(markdown)
-        
+
         return markdown

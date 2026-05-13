@@ -2,21 +2,16 @@
 LecTrans 核心模块
 """
 
-from .audio_capture import AudioCapture, AudioChunk
-from .azure_speech_recognizer import AzureSpeechRecognizer, create_azure_recognizer
-from .translator import Translator, Summarizer, create_translator, create_summarizer
-from .session_manager import SessionManager, SessionState, TranscriptEntry
+from .audio_recorder import AudioRecorder, AudioManager
+from .azure_recognizer import AzureSpeechRecognizer
+from .translator import MiMoClient
+from .session_manager import SessionManager, TranscriptEntry
 
 __all__ = [
-    "AudioCapture",
-    "AudioChunk",
+    "AudioRecorder",
+    "AudioManager",
     "AzureSpeechRecognizer",
-    "create_azure_recognizer",
-    "Translator",
-    "Summarizer",
-    "create_translator",
-    "create_summarizer",
+    "MiMoClient",
     "SessionManager",
-    "SessionState",
     "TranscriptEntry",
 ]
