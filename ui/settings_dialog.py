@@ -1,13 +1,16 @@
 """
 LecTrans 设置对话框
-Azure / MiMo / 音频设备配置
-Apple-inspired Dark Mode UI
+
+Azure / 本地 Whisper / MiMo / 音频参数配置（Apple-inspired Dark Mode UI）
 """
 
-from tkinter import *
+import logging
+from tkinter import BOTH, LEFT, RIGHT, W, X, Y, Canvas, Frame, Label, StringVar, Toplevel, VERTICAL
 from tkinter import ttk, messagebox
 
 from ui.design import DesignSystem
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsDialog:
@@ -22,7 +25,8 @@ class SettingsDialog:
 
         self.win = Toplevel(parent)
         self.win.title('设置')
-        self.win.geometry('520x620')
+        self.win.geometry('520x700')
+        self.win.minsize(480, 560)
         self.win.configure(bg=c['bg_primary'])
         self.win.transient(parent)
         self.win.grab_set()
@@ -46,27 +50,22 @@ class SettingsDialog:
         scrollbar.pack(side=RIGHT, fill=Y)
         canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
-        # 绑定鼠标滚轮
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
         self.win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         main = Frame(scroll_frame, bg=c['bg_primary'])
         main.pack(fill=BOTH, expand=True, padx=28, pady=28)
 
-        # ---- 标题 ----
         self.ds.make_label(main, '设置', style='display').pack(anchor=W, pady=(0, 6))
         self.ds.make_label(main, '配置语音识别与翻译服务',
                            style='muted').pack(anchor=W, pady=(0, 24))
 
-        # ---- 语音识别配置卡片 ----
         self._build_asr_card(main)
-
-        # ---- MiMo API 卡片 ----
         self._build_mimo_card(main)
 
-        # ---- 按钮组 ----
         btn_frame = Frame(main, bg=c['bg_primary'])
         btn_frame.pack(fill=X, pady=(20, 0))
 
@@ -77,8 +76,11 @@ class SettingsDialog:
         self.ds.make_button(btn_frame, '测试连接', self._test_connection,
                             style='secondary').pack(side=RIGHT)
 
+    # ==============================================================
+    # 语音识别卡片
+    # ==============================================================
+
     def _build_asr_card(self, parent):
-        """语音识别配置卡片"""
         c = self.ds.COLORS
 
         card = self.ds.make_card(parent)
@@ -87,7 +89,6 @@ class SettingsDialog:
         inner = Frame(card, bg=c['bg_secondary'])
         inner.pack(fill=X, padx=20, pady=20)
 
-        # 卡片标题
         title_row = Frame(inner, bg=c['bg_secondary'])
         title_row.pack(fill=X, pady=(0, 16))
         Label(title_row, text='●', font=('Segoe UI', 8),
@@ -95,7 +96,6 @@ class SettingsDialog:
         self.ds.make_label(title_row, '语音识别引擎 (ASR)', style='heading',
                            bg=c['bg_secondary']).pack(side=LEFT)
 
-        # 引擎选择
         self.ds.make_label(inner, '引擎选择', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.asr_engine_var = StringVar(value=self.config.asr_engine)
         ttk.Combobox(inner, textvariable=self.asr_engine_var,
@@ -109,7 +109,6 @@ class SettingsDialog:
         self.azure_key_var = StringVar(value=self.config.azure_key)
         self.ds.make_entry(inner, self.azure_key_var, show='●').pack(fill=X, ipady=4, pady=(0, 14))
 
-        # 区域 + 语言（横排）
         row = Frame(inner, bg=c['bg_secondary'])
         row.pack(fill=X, pady=(0, 14))
 
@@ -132,15 +131,36 @@ class SettingsDialog:
                      state='readonly').pack(fill=X, ipady=2)
 
         # ---------------- Local Whisper ----------------
-        self.ds.make_label(inner, '—— 本地 Whisper 配置 ——', style='small', bg=c['bg_secondary']).pack(anchor=W, pady=(8, 4))
-        self.ds.make_label(inner, '模型规模 (推荐 base/small)', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+        self.ds.make_label(inner, '—— 本地 Whisper 配置 ——', style='small',
+                           bg=c['bg_secondary']).pack(anchor=W, pady=(8, 4))
+        self.ds.make_label(inner, '模型规模 (推荐 base/small)', style='caption',
+                           bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.whisper_model_var = StringVar(value=self.config.whisper_model)
         ttk.Combobox(inner, textvariable=self.whisper_model_var,
                      values=['tiny', 'base', 'small', 'medium', 'large-v3'],
-                     state='readonly').pack(fill=X, ipady=2)
+                     state='readonly').pack(fill=X, ipady=2, pady=(0, 14))
+
+        vad_row = Frame(inner, bg=c['bg_secondary'])
+        vad_row.pack(fill=X)
+        vad_fields = [
+            ('噪声门限', 'energy_threshold', self.config.energy_threshold, 8),
+            ('静音断句(s)', 'silence_duration', self.config.silence_duration, 8),
+            ('最长语音(s)', 'max_utterance_seconds', self.config.max_utterance_seconds, 8),
+        ]
+        self.vad_vars = {}
+        for i, (label, key, value, width) in enumerate(vad_fields):
+            f = Frame(vad_row, bg=c['bg_secondary'])
+            f.pack(side=LEFT, fill=X, expand=True, padx=(0 if i == 0 else 6, 0))
+            self.ds.make_label(f, label, style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+            var = StringVar(value=str(value))
+            self.ds.make_entry(f, var, width=width).pack(fill=X, ipady=4)
+            self.vad_vars[key] = var
+
+    # ==============================================================
+    # MiMo 卡片
+    # ==============================================================
 
     def _build_mimo_card(self, parent):
-        """MiMo 翻译 API 配置卡片"""
         c = self.ds.COLORS
 
         card = self.ds.make_card(parent)
@@ -149,7 +169,6 @@ class SettingsDialog:
         inner = Frame(card, bg=c['bg_secondary'])
         inner.pack(fill=X, padx=20, pady=20)
 
-        # 卡片标题
         title_row = Frame(inner, bg=c['bg_secondary'])
         title_row.pack(fill=X, pady=(0, 16))
         Label(title_row, text='●', font=('Segoe UI', 8),
@@ -159,29 +178,52 @@ class SettingsDialog:
         self.ds.make_label(title_row, '翻译 / 总结', style='caption',
                            bg=c['bg_secondary']).pack(side=LEFT, padx=(8, 0))
 
-        # API Key
         self.ds.make_label(inner, 'API Key', style='caption',
                            bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.api_key_var = StringVar(value=self.config.api_key)
         self.ds.make_entry(inner, self.api_key_var, show='●').pack(fill=X, ipady=4, pady=(0, 14))
 
-        # Base URL
         self.ds.make_label(inner, 'Base URL', style='caption',
                            bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.base_url_var = StringVar(value=self.config.base_url)
         self.ds.make_entry(inner, self.base_url_var).pack(fill=X, ipady=4, pady=(0, 14))
 
-        # 模型选择
-        self.ds.make_label(inner, '翻译模型', style='caption',
-                           bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+        bottom_row = Frame(inner, bg=c['bg_secondary'])
+        bottom_row.pack(fill=X)
+
+        f1 = Frame(bottom_row, bg=c['bg_secondary'])
+        f1.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+        self.ds.make_label(f1, '翻译模型', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
         self.llm_model_var = StringVar(value=self.config.llm_model)
-        ttk.Combobox(inner, textvariable=self.llm_model_var,
+        ttk.Combobox(f1, textvariable=self.llm_model_var,
                      values=['mimo-v2.5-pro', 'mimo-v2.5'],
                      state='readonly').pack(fill=X, ipady=2)
 
-        # 提示
+        f2 = Frame(bottom_row, bg=c['bg_secondary'])
+        f2.pack(side=LEFT)
+        self.ds.make_label(f2, '上下文条数', style='caption', bg=c['bg_secondary']).pack(anchor=W, pady=(0, 4))
+        self.context_size_var = StringVar(value=str(self.config.translation_context_size))
+        self.ds.make_entry(f2, self.context_size_var, width=8).pack(ipady=4)
+
         self.ds.make_label(inner, '获取 Key → mimo.xiaomi.com', style='small',
                            bg=c['bg_secondary']).pack(anchor=W, pady=(12, 0))
+
+    # ==============================================================
+    # 保存 / 测试
+    # ==============================================================
+
+    def _read_number(self, key: str, cast, label: str):
+        """读取数值输入框，非法时回退到原配置并提示"""
+        raw = self.vad_vars[key].get().strip()
+        try:
+            value = cast(raw)
+            if value <= 0:
+                raise ValueError
+            return value
+        except ValueError:
+            old = getattr(self.config, key)
+            logger.warning("设置项 %s 输入非法: %r，保留原值 %s", label, raw, old)
+            return old
 
     def _save(self):
         self.config.asr_engine = self.asr_engine_var.get()
@@ -192,6 +234,19 @@ class SettingsDialog:
         self.config.api_key = self.api_key_var.get()
         self.config.base_url = self.base_url_var.get()
         self.config.llm_model = self.llm_model_var.get()
+
+        self.config.energy_threshold = int(self._read_number('energy_threshold', float, '噪声门限'))
+        self.config.silence_duration = float(self._read_number('silence_duration', float, '静音断句'))
+        self.config.max_utterance_seconds = float(self._read_number('max_utterance_seconds', float, '最长语音'))
+
+        try:
+            context_size = int(self.context_size_var.get().strip())
+            if context_size < 0:
+                raise ValueError
+            self.config.translation_context_size = context_size
+        except ValueError:
+            logger.warning("上下文条数输入非法，保留原值 %s", self.config.translation_context_size)
+
         self.config.save()
 
         if self.on_save:
@@ -210,6 +265,7 @@ class SettingsDialog:
             if azure_key:
                 try:
                     import azure.cognitiveservices.speech as speechsdk
+
                     speechsdk.SpeechConfig(subscription=azure_key, region=azure_region)
                     results.append("✅ Azure Speech API 配置有效")
                 except Exception as e:
@@ -218,7 +274,8 @@ class SettingsDialog:
                 results.append("⚠️ Azure API Key 未填写")
         else:
             try:
-                import faster_whisper
+                import faster_whisper  # noqa: F401
+
                 results.append("✅ Faster-Whisper 环境已安装就绪")
             except ImportError:
                 results.append("❌ Faster-Whisper 尚未安装，请通过 pip 安装")
@@ -229,6 +286,7 @@ class SettingsDialog:
         if mimo_key:
             try:
                 from openai import OpenAI
+
                 client = OpenAI(api_key=mimo_key, base_url=mimo_url)
                 client.chat.completions.create(
                     model=mimo_model,

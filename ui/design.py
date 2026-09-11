@@ -3,7 +3,7 @@ LecTrans 设计系统
 Apple-inspired Dark Mode — 统一管理颜色、字体、间距及自定义控件
 """
 
-from tkinter import *
+from tkinter import Button, Entry, Frame, Label
 from tkinter import ttk
 
 
@@ -78,22 +78,22 @@ class DesignSystem:
         try:
             root.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-            
+
             # 1. 启用 Windows 沉浸式深色模式 (Windows 10/11)
             DWMWA_USE_IMMERSIVE_DARK_MODE = 20
             value = ctypes.c_int(2)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 ctypes.byref(value), ctypes.sizeof(value)
             )
-            
+
             # 2. 设定标题栏颜色与主背景融为一体 (Windows 11)
             bg = self.COLORS['bg_primary']
             r, g, b = int(bg[1:3], 16), int(bg[3:5], 16), int(bg[5:7], 16)
             color = ctypes.c_int(b << 16 | g << 8 | r)
             DWMWA_CAPTION_COLOR = 35
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_CAPTION_COLOR, 
+                hwnd, DWMWA_CAPTION_COLOR,
                 ctypes.byref(color), ctypes.sizeof(color)
             )
         except Exception:

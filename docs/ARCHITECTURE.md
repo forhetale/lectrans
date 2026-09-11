@@ -1,523 +1,154 @@
 # LecTrans - 技术架构设计
 
+> 本文档描述 v0.2 重构后的实际架构（单路音频管线 + 异步翻译 + 惰性导入）。
+
 ## 1. 系统架构图
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      LecTrans 系统架构                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   音频采集    │───▶│   语音识别    │───▶│   翻译引擎    │  │
-│  │  PyAudio     │    │  Groq Whisper │    │  DeepSeek    │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│         │                   │                   │           │
-│         ▼                   ▼                   ▼           │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                    状态管理器                         │  │
-│  │              (Session State Manager)                  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                            │                                │
-│                            ▼                                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   UI 展示     │◀──│   总结引擎    │◀──│   存档管理    │  │
-│  │  Streamlit   │    │  LLM Summary │    │  Markdown    │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                           LecTrans 进程                                │
+│                                                                       │
+│  ┌────────────────┐        ┌───────────────────────────────┐          │
+│  │ AudioRecorder  │        │  识别线程（local 或 azure）    │          │
+│  │ 采集线程        │ 队列   │  - 自适应能量 VAD（local）     │          │
+│  │ - 单路 PyAudio │───────▶│  - Azure 连续识别事件          │          │
+│  │ - 边录边写 WAV │        └───────────────┬───────────────┘          │
+│  │ - 订阅分发     │                        │ on_recognized(韩语)       │
+│  └───────┬────────┘                        ▼                          │
+│          │                      ┌───────────────────────┐             │
+│          │                      │ 翻译队列 (maxsize=64)  │             │
+│          │                      └───────────┬───────────┘             │
+│          │                                  ▼                         │
+│          │                      ┌───────────────────────┐             │
+│          │                      │ 翻译 Worker 线程       │             │
+│          │                      │ MiMo + 最近 N 条上下文 │             │
+│          │                      └───────────┬───────────┘             │
+│          │                                  │ msg_queue             │
+│          │                                  ▼                       │
+│          │                      ┌───────────────────────┐             │
+│          │                      │ 主线程 (tkinter)       │             │
+│          │                      │ after(100ms) 消费队列  │             │
+│          │                      │ 双栏渲染 / 状态更新    │             │
+│          │                      └───────────┬───────────┘             │
+│          │                                  │                         │
+│          ▼                                  ▼                         │
+│   stop() 后 MP3 转换 ──────────▶ SessionManager 自动保存（JSON + 录音）│
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-## 2. 模块设计
-
-### 2.1 模块划分
+## 2. 模块划分
 
 ```
 lectrans/
-├── main.py                 # 主入口
-├── config.py               # 配置管理
+├── main.py                    # 入口：dotenv → setup_logging → LecTransApp
+├── config.py                  # AppConfig：JSON + keyring + 环境变量覆盖
 ├── core/
-│   ├── audio_capture.py    # 音频采集模块
-│   ├── speech_recognizer.py # 语音识别模块
-│   ├── translator.py       # 翻译模块
-│   ├── summarizer.py       # 总结模块
-│   └── session_manager.py  # 会话管理
-├── services/
-│   ├── groq_service.py     # Groq API 封装
-│   ├── deepseek_service.py # DeepSeek API 封装
-│   └── openai_service.py   # OpenAI 兼容 API 封装
+│   ├── audio_recorder.py      # AudioRecorder / AudioManager
+│   ├── local_recognizer.py    # LocalWhisperRecognizer（消费共享队列）
+│   ├── azure_recognizer.py    # AzureSpeechRecognizer（PushAudioInputStream）
+│   ├── translator.py          # MiMoClient（翻译/总结，重试 + 上下文）
+│   ├── session_manager.py     # SessionManager / TranscriptEntry
+│   ├── platform_utils.py      # open_path / reveal_in_folder
+│   ├── logger.py              # setup_logging / get_logger
+│   └── types.py               # TranscriptionResult
+├── prompts/templates.py       # 翻译/总结 Prompt + CS 术语表
 ├── ui/
-│   ├── app.py              # Streamlit 主界面
-│   ├── components.py       # UI 组件
-│   └── styles.css          # 样式文件
-├── utils/
-│   ├── audio_utils.py      # 音频工具函数
-│   ├── text_utils.py       # 文本工具函数
-│   └── file_utils.py       # 文件工具函数
-├── prompts/
-│   ├── translation.py      # 翻译 Prompt
-│   └── summary.py          # 总结 Prompt
-├── requirements.txt        # 依赖列表
-└── README.md               # 说明文档
+│   ├── app.py                 # 主窗口与线程接线
+│   ├── design.py              # DesignSystem：颜色/字体/控件工厂
+│   ├── settings_dialog.py     # 设置对话框
+│   └── history_dialog.py      # 历史记录对话框
+└── tests/                     # unittest 测试套件
 ```
 
-### 2.2 核心模块设计
+## 3. 核心设计决策
 
-#### 2.2.1 音频采集模块 (audio_capture.py)
+### 3.1 单路音频管线（解决设备争抢）
 
-```python
-class AudioCapture:
-    """音频采集器，负责从麦克风捕获音频流"""
-    
-    def __init__(self, sample_rate=16000, chunk_size=1024):
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.audio = pyaudio.PyAudio()
-        self.stream = None
-        self.is_recording = False
-    
-    def start(self):
-        """开始录音"""
-        self.stream = self.audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self.sample_rate,
-            input=True,
-            frames_per_buffer=self.chunk_size
-        )
-        self.is_recording = True
-    
-    def stop(self):
-        """停止录音"""
-        self.is_recording = False
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-    
-    def read_chunk(self) -> bytes:
-        """读取一个音频块"""
-        if self.is_recording and self.stream:
-            return self.stream.read(self.chunk_size)
-        return b""
-```
+旧版由识别器和录音器各自 `pyaudio.open()`，双流并发存在争抢、失败与采样不同步风险。
+重构后仅 `AudioRecorder` 持有麦克风：
 
-#### 2.2.2 语音识别模块 (speech_recognizer.py)
+- 采集线程按 `chunk_size=1024`（16kHz 下 64ms）读取 PCM
+- 录声音轨直接 `wave.writeframes()` 落盘，长课堂不再把整段 PCM 留在内存
+- 通过 `subscribe()` 向消费者分发，队列满时**丢弃最旧块**，保证实时性
+- Azure 模式使用 `PushAudioInputStream` 推送同一数据流，设备选择与录音完全一致
 
-```python
-class SpeechRecognizer:
-    """语音识别器，使用 Groq Whisper API"""
-    
-    def __init__(self, api_key: str):
-        self.client = Groq(api_key=api_key)
-        self.buffer = []
-        self.buffer_duration = 3  # 3 秒缓冲
-    
-    async def transcribe(self, audio_chunk: bytes) -> Optional[str]:
-        """转录音频块"""
-        self.buffer.append(audio_chunk)
-        
-        # 检查缓冲区是否达到阈值
-        if self._buffer_duration() >= self.buffer_duration:
-            audio_data = self._merge_buffer()
-            return await self._call_api(audio_data)
-        
-        return None
-    
-    async def _call_api(self, audio_data: bytes) -> str:
-        """调用 Groq Whisper API"""
-        response = await self.client.audio.transcriptions.create(
-            file=("audio.wav", audio_data),
-            model="whisper-large-v3-turbo",
-            language="ko"
-        )
-        return response.text
-```
+### 3.2 识别与翻译解耦（解决阻塞）
 
-#### 2.2.3 翻译模块 (translator.py)
+旧版在识别回调中同步调用翻译 API，会阻塞识别循环/事件线程。
+现在识别回调只做 `translation_queue.put()`（超时 5s，满则丢弃并告警），
+翻译 Worker 串行处理并在 HTTP 层重试，UI 始终不阻塞。
 
-```python
-class Translator:
-    """翻译器，使用 OpenAI 兼容 API"""
-    
-    def __init__(self, api_key: str, base_url: str, model: str):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-        self.history = []
-    
-    async def translate(self, korean_text: str) -> str:
-        """翻译韩语为中文"""
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": TRANSLATION_PROMPT},
-                {"role": "user", "content": korean_text}
-            ],
-            stream=True
-        )
-        
-        # 流式返回翻译结果
-        async for chunk in response:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-```
+### 3.3 翻译上下文与术语增强
 
-#### 2.2.4 总结模块 (summarizer.py)
+`MiMoClient.translate()` 支持传入最近 N 条（配置 `translation_context_size`，默认 5）双语对照，
+与系统 Prompt 中的 CS 术语表一起注入，改善指代和术语一致性。
 
-```python
-class Summarizer:
-    """总结生成器"""
-    
-    def __init__(self, api_key: str, base_url: str, model: str):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-    
-    async def summarize(self, transcript: str) -> str:
-        """生成课堂总结"""
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": SUMMARY_PROMPT},
-                {"role": "user", "content": transcript}
-            ]
-        )
-        return response.choices[0].message.content
-```
+### 3.4 会话收尾异步化
 
----
+停止录音后由 finalizer 线程等待翻译队列排空（最多 60s），
+再通过 `msg_queue` 通知主线程保存会话，避免 UI 卡顿且不丢最后一两句翻译。
+`session_token` 机制确保已过期会话的迟到结果不会写入新会话。
 
-## 3. 数据流设计
+### 3.5 惰性导入（PEP 562）
 
-### 3.1 实时翻译流程
+`core/__init__.py` 使用模块级 `__getattr__` 按需加载子模块：
+只装本地依赖的用户不再因为缺少 Azure SDK 而无法 `import core`。
+
+## 4. 数据流
+
+### 4.1 实时翻译
 
 ```
-用户点击 Start
-      │
-      ▼
-┌─────────────────┐
-│  开始音频采集    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌─────────────────┐
-│  读取音频块     │────▶│  缓冲区累积     │
-└─────────────────┘     └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  检测静音断句    │
-                        │  (WebRTC VAD)   │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  发送到 Whisper  │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  获取韩语文本    │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  发送到翻译 API  │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  流式返回中文    │
-                        └────────┬────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │  更新 UI 显示    │
-                        └─────────────────┘
+点击开始 → AudioRecorder.start()（采集+落盘线程）
+        → recognizer.start_continuous_recognition(queue)
+        → 识别结果 → 翻译队列 → 翻译 Worker → msg_queue → 主线程渲染
 ```
 
-### 3.2 总结生成流程
+### 4.2 停止与存档
 
 ```
-用户点击 Summary
-      │
-      ▼
-┌─────────────────┐
-│  收集历史记录    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  构建 Prompt    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  调用 LLM API   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  解析返回结果    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  显示总结面板    │
-└─────────────────┘
+点击停止 → recognizer.stop() → AudioRecorder.stop()（返回 WAV 路径）
+        → 翻译队列置入哨兵 → finalizer 等待 Worker 结束
+        → 主线程：WAV → MP3（失败则保留 WAV，记录真实路径）
+        → SessionManager.save_session(JSON)
 ```
 
----
+## 5. 本地 VAD 设计
 
-## 4. API 设计
+- **能量门限**：`threshold = max(energy_threshold, noise_floor × 3.0)`
+- **底噪估计**：非语音段对 RMS 做 EMA（0.95/0.05），自动适应环境噪声
+- **断句**：连续静音 ≥ `silence_duration`（默认 0.8s）
+- **最长句**：累计语音 ≥ `max_utterance_seconds`（默认 20s）强制切分，防止延迟膨胀
+- **过滤**：短于 `min_speech_duration`（0.5s）的片段丢弃
+- 推理侧再启用 faster-whisper 的 `vad_filter=True` 二次过滤
 
-### 4.1 内部接口
+## 6. 错误处理与可观测性
 
-```python
-# 音频采集接口
-class IAudioCapture(Protocol):
-    def start(self) -> None: ...
-    def stop(self) -> None: ...
-    def read_chunk(self) -> bytes: ...
+| 机制 | 说明 |
+|------|------|
+| 日志 | `core/logger.py`，滚动文件 `~/.lectrans/lectrans.log` + 控制台 |
+| API 重试 | 翻译/总结失败重试 2 次（1s/2s 退避），仍失败返回占位文本 |
+| 识别错误 | 通过 `on_error` 回调 → 消息队列 → 主线程弹窗 |
+| 损坏数据 | 会话 JSON 解析失败跳过并告警，不影响列表 |
+| 录音回退 | pydub/ffmpeg 缺失时自动保留 WAV，会话记录真实路径 |
 
-# 语音识别接口
-class ISpeechRecognizer(Protocol):
-    async def transcribe(self, audio: bytes) -> Optional[str]: ...
+## 7. 配置与安全
 
-# 翻译接口
-class ITranslator(Protocol):
-    async def translate(self, text: str) -> AsyncGenerator[str, None]: ...
+- 配置优先级：**环境变量 > keyring > config.json > 默认值**
+- API Key 优先写入系统钥匙串；不可用时才写入 JSON（POSIX 下限制为 600）
+- 配置文件原子写入（临时文件 + `os.replace`）
+- 本地引擎音频不出本机；云端引擎音频发送至 Azure Speech
 
-# 总结接口
-class ISummarizer(Protocol):
-    async def summarize(self, transcript: str) -> str: ...
-```
+## 8. 打包
 
-### 4.2 外部 API 调用
+- `LecTrans.spec` 通过 `collect_all("azure.cognitiveservices.speech")` 自动收集 SDK 原生 DLL，
+  `collect_submodules` 收集 openai/keyring，**不含任何本机绝对路径**
+- exe 面向 Azure 引擎；`numpy`/`faster_whisper` 等本地引擎依赖被排除以控制体积
+- CI 在 `workflow_dispatch` 时于 Windows 上构建并上传产物
 
-#### Groq Whisper API
-```python
-# 请求
-POST https://api.groq.com/openai/v1/audio/transcriptions
-Content-Type: multipart/form-data
+## 9. 已知限制
 
-file: audio.wav
-model: whisper-large-v3-turbo
-language: ko
-
-# 响应
-{
-    "text": "안녕하세요, 오늘 컴퓨터 과학 수업을 시작하겠습니다."
-}
-```
-
-#### DeepSeek Chat API
-```python
-# 请求
-POST https://api.deepseek.com/v1/chat/completions
-Content-Type: application/json
-
-{
-    "model": "deepseek-chat",
-    "messages": [
-        {"role": "system", "content": "你是韩中翻译官..."},
-        {"role": "user", "content": "안녕하세요..."}
-    ],
-    "stream": true
-}
-
-# 响应 (SSE)
-data: {"choices":[{"delta":{"content":"你好"}}]}
-data: {"choices":[{"delta":{"content":"，今天"}}]}
-...
-```
-
----
-
-## 5. 状态管理
-
-### 5.1 会话状态
-
-```python
-@dataclass
-class SessionState:
-    """会话状态"""
-    is_recording: bool = False
-    is_connected: bool = False
-    
-    # 转录记录
-    transcripts: List[TranscriptEntry] = field(default_factory=list)
-    
-    # 翻译记录
-    translations: List[TranslationEntry] = field(default_factory=list)
-    
-    # 总结
-    summary: Optional[str] = None
-    
-    # 配置
-    config: AppConfig = field(default_factory=AppConfig)
-
-@dataclass
-class TranscriptEntry:
-    """转录条目"""
-    timestamp: datetime
-    korean_text: str
-    chinese_text: str
-```
-
-### 5.2 状态持久化
-
-```python
-class SessionPersistence:
-    """会话持久化"""
-    
-    def save(self, state: SessionState, filepath: str):
-        """保存会话到文件"""
-        data = {
-            "timestamp": datetime.now().isoformat(),
-            "transcripts": [
-                {
-                    "time": t.timestamp.isoformat(),
-                    "ko": t.korean_text,
-                    "zh": t.chinese_text
-                }
-                for t in state.transcripts
-            ],
-            "summary": state.summary
-        }
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            yaml.dump(data, f, allow_unicode=True)
-    
-    def load(self, filepath: str) -> SessionState:
-        """从文件加载会话"""
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-        
-        # 转换为 SessionState
-        ...
-```
-
----
-
-## 6. 错误处理
-
-### 6.1 错误类型
-
-```python
-class LecTransError(Exception):
-    """基础异常"""
-    pass
-
-class AudioCaptureError(LecTransError):
-    """音频采集错误"""
-    pass
-
-class APIConnectionError(LecTransError):
-    """API 连接错误"""
-    pass
-
-class TranscriptionError(LecTransError):
-    """转录错误"""
-    pass
-
-class TranslationError(LecTransError):
-    """翻译错误"""
-    pass
-```
-
-### 6.2 重试机制
-
-```python
-class RetryHandler:
-    """重试处理器"""
-    
-    def __init__(self, max_retries=3, delay=1):
-        self.max_retries = max_retries
-        self.delay = delay
-    
-    async def execute(self, func, *args, **kwargs):
-        """执行函数，失败时重试"""
-        last_error = None
-        
-        for attempt in range(self.max_retries):
-            try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(self.delay * (attempt + 1))
-        
-        raise last_error
-```
-
----
-
-## 7. 性能优化
-
-### 7.1 音频缓冲优化
-- 使用环形缓冲区，避免内存增长
-- 异步读取，不阻塞主线程
-
-### 7.2 API 调用优化
-- 流式处理，减少等待时间
-- 连接池复用，减少连接开销
-- 请求合并，减少 API 调用次数
-
-### 7.3 UI 更新优化
-- 虚拟滚动，只渲染可见区域
-- 防抖更新，避免频繁刷新
-
----
-
-## 8. 安全考虑
-
-### 8.1 API Key 保护
-- 配置文件加密存储
-- 环境变量优先读取
-- 不在日志中输出
-
-### 8.2 数据隐私
-- 音频数据本地处理，不上传
-- 转录记录本地存储
-- 支持手动清除记录
-
----
-
-## 9. 依赖列表
-
-```txt
-# requirements.txt
-
-# 音频处理
-pyaudio==0.2.14
-webrtcvad==2.0.10
-numpy==1.26.4
-
-# API 客户端
-openai==1.50.0
-groq==0.11.0
-httpx==0.27.0
-
-# 前端
-streamlit==1.39.0
-
-# 工具
-pyyaml==6.0.2
-python-dotenv==1.0.1
-rich==13.9.0
-
-# 可选：PDF 生成
-reportlab==4.2.3
-```
-
----
-
-## 10. 开发环境
-
-### 10.1 环境要求
-- Python 3.9+
-- 系统麦克风权限
-- 网络连接（API 调用）
-
-### 10.2 开发工具
-- IDE: VS Code / PyCharm
-- 包管理: pip / poetry
-- 版本控制: Git
+- 翻译为整句返回，尚未流式输出
+- 本地引擎首次运行需下载 Whisper 模型，且未打包进 exe
+- 仅支持韩→中（语言对在设置中预留）
+- MiMo TTS 语音播报为路线图功能，尚未实现

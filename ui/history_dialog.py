@@ -6,11 +6,28 @@ Apple-inspired Dark Mode UI
 
 import os
 from datetime import datetime
-from tkinter import *
+from tkinter import (
+    BOTH,
+    BOTTOM,
+    DISABLED,
+    END,
+    LEFT,
+    NORMAL,
+    RIGHT,
+    VERTICAL,
+    WORD,
+    X,
+    Y,
+    Frame,
+    Label,
+    Text,
+    Toplevel,
+)
 from tkinter import ttk, messagebox, filedialog
 
+from core.platform_utils import open_path, reveal_in_folder
+from core.session_manager import SessionManager
 from ui.design import DesignSystem
-from core.session_manager import SessionManager, TranscriptEntry
 
 
 class HistoryDialog:
@@ -244,8 +261,8 @@ class HistoryDialog:
         if not rec_path or not os.path.exists(rec_path):
             messagebox.showinfo('提示', '该会话没有关联录音文件')
             return
-        # 使用系统默认播放器
-        os.startfile(rec_path)
+        if not open_path(rec_path):
+            messagebox.showwarning('提示', '无法打开录音文件')
 
     def _open_recording_folder(self):
         """在资源管理器中显示关联录音"""
@@ -257,17 +274,15 @@ class HistoryDialog:
         if not rec_path or not os.path.exists(rec_path):
             messagebox.showinfo('提示', '该会话没有关联录音文件')
             return
-        
-        # 在 Windows 资源管理器中选中该文件
-        import subprocess
-        subprocess.Popen(f'explorer /select,"{os.path.abspath(rec_path)}"')
+        if not reveal_in_folder(rec_path):
+            messagebox.showwarning('提示', '无法打开所在文件夹')
 
     def _delete_session(self):
         """删除选中会话"""
         if not self.selected_session_id:
             messagebox.showwarning('提示', '请先选择一个会话')
             return
-        if messagebox.askyesno('确认', f'确定删除该会话？\n(会同时删除关联录音)'):
+        if messagebox.askyesno('确认', '确定删除该会话？\n(会同时删除关联录音)'):
             self.session_mgr.delete_session(self.selected_session_id)
             self.selected_session_id = None
             # 清空详情

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lectrans"
+version = "0.2.0"
+description = "实时韩中课堂翻译桌面工具（faster-whisper / Azure Speech + MiMo）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "LecTrans Contributors" }]
+keywords = ["translation", "asr", "whisper", "mimo", "lecture"]
+# 运行时依赖以 requirements.txt 为准（含可选引擎依赖，便于按需安装）
+
+[project.urls]
+Repository = "https://github.com/forhetale/lectrans"
+
+[tool.setuptools]
+packages = ["core", "ui", "prompts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [".venv", "build", "dist", "scratch"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

@@ -1,28 +1,57 @@
 """
 LecTrans 主窗口
-tkinter 桌面应用，实时韩→中课堂翻译
-Apple-inspired Dark Mode UI
+
+tkinter 桌面应用，实时韩→中课堂翻译（Apple-inspired Dark Mode UI）。
+
+线程模型：
+- AudioRecorder 单路采集，向识别器队列分发音频块
+- 识别器在后台线程产出韩语文本，仅入队翻译队列（不阻塞识别循环）
+- 翻译 worker 线程串行调用 MiMo API，携带滚动上下文，结果入 UI 消息队列
+- 主线程通过 after() 消费消息队列更新界面；会话保存由 finalizer 线程收尾
 """
 
+import queue
 import sys
 import threading
-import queue
 from datetime import datetime
 from pathlib import Path
-from tkinter import *
+from tkinter import (
+    BOTH,
+    BOTTOM,
+    DISABLED,
+    END,
+    LEFT,
+    NORMAL,
+    RIGHT,
+    TOP,
+    VERTICAL,
+    WORD,
+    X,
+    Y,
+    Button,
+    Frame,
+    Label,
+    StringVar,
+    Text,
+    Tk,
+    Toplevel,
+)
 from tkinter import ttk, messagebox, filedialog
-from typing import Optional, List
+from typing import List, Optional
 
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import AppConfig, RECORDINGS_DIR
-from ui.design import DesignSystem
-from ui.settings_dialog import SettingsDialog
-from ui.history_dialog import HistoryDialog
-from core.audio_recorder import AudioRecorder, AudioManager
-from core.translator import MiMoClient
+from config import APP_VERSION, RECORDINGS_DIR, AppConfig
+from core.audio_recorder import AudioManager, AudioRecorder
+from core.logger import get_logger
 from core.session_manager import SessionManager, TranscriptEntry
+from core.translator import MiMoClient
+from ui.design import DesignSystem
+from ui.history_dialog import HistoryDialog
+from ui.settings_dialog import SettingsDialog
+
+logger = get_logger(__name__)
 
 
 class LecTransApp:
@@ -30,7 +59,7 @@ class LecTransApp:
 
     def __init__(self):
         self.root = Tk()
-        self.root.title('LecTrans')
+        self.root.title(f'LecTrans v{APP_VERSION}')
         self.root.geometry('1060x720')
         self.root.minsize(760, 480)
 
@@ -45,12 +74,16 @@ class LecTransApp:
         self.summary = ''
         self.recording_start_time: Optional[datetime] = None
         self.session_id: Optional[str] = None
+        self.session_token = 0
 
         # 组件
         self.mimo_client: Optional[MiMoClient] = None
         self.recognizer = None
         self.audio_recorder: Optional[AudioRecorder] = None
-        self.msg_queue = queue.Queue()
+        self.msg_queue: queue.Queue = queue.Queue()
+        self.translation_queue: queue.Queue = queue.Queue(maxsize=64)
+        self.translation_thread: Optional[threading.Thread] = None
+        self._finalizing = False
 
         # 应用主题
         self.root.configure(bg=self.ds.COLORS['bg_primary'])
@@ -58,6 +91,10 @@ class LecTransApp:
 
         # 创建界面
         self._create_layout()
+
+        # 已配置则预先初始化客户端（不联网，仅构建与状态显示）
+        if self.config.is_configured:
+            self._init_components()
 
         # 检查配置
         if not self.config.is_configured:
@@ -79,24 +116,16 @@ class LecTransApp:
         navbar.pack(fill=X, side=TOP)
         navbar.pack_propagate(False)
 
-        # 左侧品牌
         left_nav = Frame(navbar, bg=c['bg_secondary'])
         left_nav.pack(side=LEFT, padx=20, fill=Y)
 
-        # 品牌小圆点 + 名称
-        brand_dot = Label(left_nav, text='●', font=('Segoe UI', 10),
-                          fg=c['accent'], bg=c['bg_secondary'])
-        brand_dot.pack(side=LEFT, pady=0)
+        Label(left_nav, text='●', font=('Segoe UI', 10),
+              fg=c['accent'], bg=c['bg_secondary']).pack(side=LEFT, pady=0)
+        Label(left_nav, text='LecTrans', font=self.ds.FONTS['title'],
+              fg=c['text_primary'], bg=c['bg_secondary']).pack(side=LEFT, padx=(8, 0))
+        Label(left_nav, text='实时课堂翻译', font=self.ds.FONTS['small'],
+              fg=c['text_muted'], bg=c['bg_secondary']).pack(side=LEFT, padx=(10, 0))
 
-        brand_label = Label(left_nav, text='LecTrans', font=self.ds.FONTS['title'],
-                            fg=c['text_primary'], bg=c['bg_secondary'])
-        brand_label.pack(side=LEFT, padx=(8, 0))
-
-        subtitle = Label(left_nav, text='实时课堂翻译', font=self.ds.FONTS['small'],
-                         fg=c['text_muted'], bg=c['bg_secondary'])
-        subtitle.pack(side=LEFT, padx=(10, 0))
-
-        # 右侧导航按钮
         right_nav = Frame(navbar, bg=c['bg_secondary'])
         right_nav.pack(side=RIGHT, padx=16, fill=Y)
 
@@ -105,7 +134,6 @@ class LecTransApp:
                           ('设置', self._show_settings)]:
             self._make_nav_btn(right_nav, text, cmd)
 
-        # 分隔线
         self.ds.make_separator(self.root).pack(fill=X)
 
         # ──── 控制栏 ────
@@ -116,12 +144,10 @@ class LecTransApp:
         control_inner = Frame(control_frame, bg=c['bg_primary'])
         control_inner.pack(fill=BOTH, expand=True, padx=20, pady=10)
 
-        # 录音药丸按钮
         self.record_btn = self.ds.make_pill_button(
             control_inner, text='● 开始录音', command=self._toggle_recording, color='success')
         self.record_btn.pack(side=LEFT, padx=(0, 16))
 
-        # 录音计时
         self.recording_time_label = Label(
             control_inner, text='', font=self.ds.FONTS['mono'],
             fg=c['accent'], bg=c['bg_primary'], width=6)
@@ -135,14 +161,11 @@ class LecTransApp:
               fg=c['text_muted'], bg=c['bg_primary']).pack(side=LEFT, padx=(0, 8))
 
         self.device_var = StringVar(value='默认设备')
-        devices = AudioManager.get_input_devices()
-        self.device_list = devices
-        device_names = [d['name'] for d in devices]
-
+        self.device_list = AudioManager.get_input_devices()
         self.device_combo = ttk.Combobox(
             device_frame, textvariable=self.device_var,
-            values=device_names, state='readonly', width=22,
-            font=self.ds.FONTS['small'])
+            values=[d['name'] for d in self.device_list],
+            state='readonly', width=22, font=self.ds.FONTS['small'])
         self.device_combo.pack(side=LEFT)
         self.device_combo.bind('<<ComboboxSelected>>', self._on_device_change)
 
@@ -154,6 +177,29 @@ class LecTransApp:
                             style='ghost').pack(side=RIGHT, padx=(8, 0))
         self.ds.make_button(right_actions, '生成总结', self._generate_summary,
                             style='secondary').pack(side=RIGHT)
+
+        # ──── 状态栏（先于内容区打包，避免 expand 占满空间） ────
+        status_bar = Frame(self.root, bg=c['bg_secondary'], height=self.ds.STATUSBAR_HEIGHT)
+        status_bar.pack(fill=X, side=BOTTOM)
+        status_bar.pack_propagate(False)
+
+        self.status_dot = Label(status_bar, text='●', fg=c['error'],
+                                bg=c['bg_secondary'], font=('Segoe UI', 7))
+        self.status_dot.pack(side=LEFT, padx=(16, 4))
+
+        self.status_text = Label(status_bar, text=self._status_text(),
+                                 fg=c['text_muted'], bg=c['bg_secondary'],
+                                 font=self.ds.FONTS['small'])
+        self.status_text.pack(side=LEFT, padx=(0, 16))
+
+        self.entry_count = Label(status_bar, text='0 条记录',
+                                 fg=c['text_muted'], bg=c['bg_secondary'],
+                                 font=self.ds.FONTS['small'])
+        self.entry_count.pack(side=LEFT)
+
+        self.time_label = Label(status_bar, text='', fg=c['text_muted'],
+                                bg=c['bg_secondary'], font=self.ds.FONTS['mono'])
+        self.time_label.pack(side=RIGHT, padx=16)
 
         # ──── 内容区（双栏） ────
         content_frame = Frame(self.root, bg=c['bg_primary'])
@@ -168,34 +214,19 @@ class LecTransApp:
         self.zh_card = self._create_text_card(content_frame, '中文', '#0A84FF')
         self.zh_card.grid(row=0, column=1, sticky='nsew', padx=(6, 12), pady=(4, 8))
 
-        # ──── 状态栏 ────
-        status_bar = Frame(self.root, bg=c['bg_secondary'], height=self.ds.STATUSBAR_HEIGHT)
-        status_bar.pack(fill=X, side=BOTTOM)
-        status_bar.pack_propagate(False)
-
-        self.status_dot = Label(status_bar, text='●', fg=c['error'],
-                                bg=c['bg_secondary'], font=('Segoe UI', 7))
-        self.status_dot.pack(side=LEFT, padx=(16, 4))
-
-        self.status_text = Label(status_bar, text='ASR: Azure  ·  翻译: MiMo',
-                                 fg=c['text_muted'], bg=c['bg_secondary'],
-                                 font=self.ds.FONTS['small'])
-        self.status_text.pack(side=LEFT, padx=(0, 16))
-
-        self.entry_count = Label(status_bar, text='0 条记录',
-                                 fg=c['text_muted'], bg=c['bg_secondary'],
-                                 font=self.ds.FONTS['small'])
-        self.entry_count.pack(side=LEFT)
-
-        self.time_label = Label(status_bar, text='', fg=c['text_muted'],
-                                bg=c['bg_secondary'], font=self.ds.FONTS['mono'])
-        self.time_label.pack(side=RIGHT, padx=16)
-
         self._update_time()
 
     # ==============================================================
     # UI 辅助
     # ==============================================================
+
+    def _engine_label(self) -> str:
+        return 'Azure' if self.config.asr_engine == 'azure' else '本地 Whisper'
+
+    def _status_text(self) -> str:
+        if self.is_connected:
+            return f'ASR: {self._engine_label()}  ·  翻译: MiMo'
+        return f'ASR: {self._engine_label()}  ·  翻译: 未连接'
 
     def _make_nav_btn(self, parent, text, command):
         """创建导航栏按钮"""
@@ -216,17 +247,14 @@ class LecTransApp:
         c = self.ds.COLORS
         card = self.ds.make_card(parent)
 
-        # 标题区
         header = Frame(card, bg=c['bg_secondary'])
         header.pack(fill=X, padx=16, pady=(14, 6))
 
-        # 彩色小圆点 + 标题
         Label(header, text='●', font=('Segoe UI', 8),
               fg=dot_color, bg=c['bg_secondary']).pack(side=LEFT, padx=(0, 8))
         Label(header, text=title, font=self.ds.FONTS['heading'],
               fg=c['text_primary'], bg=c['bg_secondary']).pack(side=LEFT)
 
-        # 文本区
         text_frame = Frame(card, bg=c['bg_secondary'])
         text_frame.pack(fill=BOTH, expand=True, padx=12, pady=(0, 12))
 
@@ -267,6 +295,7 @@ class LecTransApp:
             if d['name'] == device_name:
                 self.config.audio_device_index = d['index']
                 self.config.save()
+                logger.info("切换音频设备: %s", d['name'])
                 break
 
     def _show_settings(self):
@@ -275,6 +304,7 @@ class LecTransApp:
     def _on_settings_saved(self):
         self.is_connected = False
         self._init_components()
+        self.status_text.config(text=self._status_text())
 
     def _show_history(self):
         HistoryDialog(self.root)
@@ -290,11 +320,16 @@ class LecTransApp:
                 if msg_type == 'transcript':
                     self._add_transcript(data['korean'], data['chinese'])
                 elif msg_type == 'status':
-                    self._update_status(data['connected'])
+                    self.is_connected = data['connected']
+                    self.status_text.config(text=self._status_text())
+                    self.status_dot.config(
+                        fg=self.ds.COLORS['success'] if data['connected'] else self.ds.COLORS['error'])
                 elif msg_type == 'error':
                     messagebox.showerror('错误', data)
+                elif msg_type == 'finalize':
+                    self._finalize_session(data)
                 elif msg_type == 'log':
-                    print(f"[LOG] {data}")
+                    logger.info(data)
         except queue.Empty:
             pass
         self.root.after(100, self._process_queue)
@@ -313,10 +348,12 @@ class LecTransApp:
             return False
 
         try:
-            self.mimo_client = MiMoClient(self.config.api_key, self.config.base_url)
+            self.mimo_client = MiMoClient(
+                self.config.api_key, self.config.base_url, timeout=self.config.api_timeout)
 
             if self.config.asr_engine == "azure":
                 from core.azure_recognizer import AzureSpeechRecognizer
+
                 self.recognizer = AzureSpeechRecognizer(
                     subscription_key=self.config.azure_key,
                     region=self.config.azure_region,
@@ -324,13 +361,16 @@ class LecTransApp:
                 )
             else:
                 from core.local_recognizer import LocalWhisperRecognizer
-                # 默认只传 ko 因为目前软件固定处理韩语
+
                 self.recognizer = LocalWhisperRecognizer(
                     model_size=self.config.whisper_model,
                     device_index=self.config.audio_device_index,
                     sample_rate=self.config.sample_rate,
+                    energy_threshold=self.config.energy_threshold,
+                    silence_duration=self.config.silence_duration,
+                    max_utterance_seconds=self.config.max_utterance_seconds,
                 )
-                
+
             self.recognizer.on_recognized = self._on_recognized
             self.recognizer.on_error = self._on_error
 
@@ -338,6 +378,7 @@ class LecTransApp:
             self.msg_queue.put(('status', {'connected': True}))
             return True
         except Exception as e:
+            logger.exception("初始化失败")
             self.msg_queue.put(('error', f'初始化失败: {str(e)}'))
             return False
 
@@ -352,34 +393,53 @@ class LecTransApp:
             self._start_recording()
 
     def _start_recording(self):
-        if not self.is_connected:
-            if not self._init_components():
-                return
+        if self._finalizing:
+            messagebox.showinfo('提示', '正在保存上一段录音，请稍候')
+            return
 
-        if self.recognizer and self.recognizer.start_continuous_recognition():
-            self.is_recording = True
-            self.recording_start_time = datetime.now()
-            self.session_id = self.recording_start_time.strftime("%Y%m%d_%H%M%S")
-            self.transcripts = []
-            self.summary = ''
+        if not self.is_connected and not self._init_components():
+            return
 
-            # 启动音频录制器（用于保存录音）
-            self.audio_recorder = AudioRecorder(
-                sample_rate=self.config.sample_rate,
-                device_index=self.config.audio_device_index,
-            )
-            self.audio_recorder.start()
+        self.session_token += 1
+        token = self.session_token
+        self.recording_start_time = datetime.now()
+        self.session_id = self.recording_start_time.strftime("%Y%m%d_%H%M%S")
+        self.transcripts = []
+        self.summary = ''
 
-            self.record_btn.configure(
-                text='■ 停止录音',
-                bg=self.ds.COLORS['error'],
-                activebackground='#D32F2F')
-            # 更新 hover 绑定
-            self.record_btn.bind('<Enter>', lambda e: self.record_btn.configure(bg='#D32F2F'))
-            self.record_btn.bind('<Leave>', lambda e: self.record_btn.configure(bg=self.ds.COLORS['error']))
-            self._update_recording_time()
-        else:
-            messagebox.showerror('错误', '无法启动语音识别，请检查麦克风')
+        # 1) 单路音频采集（同时落盘与分发）
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        wav_path = RECORDINGS_DIR / f"{self.session_id}.wav"
+        self.audio_recorder = AudioRecorder(
+            sample_rate=self.config.sample_rate,
+            device_index=self.config.audio_device_index,
+            output_path=str(wav_path),
+        )
+        if not self.audio_recorder.start():
+            self.audio_recorder = None
+            messagebox.showerror('错误', '无法打开麦克风，请检查设备与权限')
+            return
+
+        # 2) 识别器消费共享音频队列
+        audio_queue = self.audio_recorder.subscribe()
+        if not self.recognizer.start_continuous_recognition(audio_queue):
+            self.audio_recorder.stop()
+            self.audio_recorder = None
+            messagebox.showerror('错误', '无法启动语音识别，请检查设置或安装依赖')
+            return
+
+        # 3) 启动翻译 worker
+        self._start_translation_worker(token)
+
+        self.is_recording = True
+        self.record_btn.configure(
+            text='■ 停止录音',
+            bg=self.ds.COLORS['error'],
+            activebackground='#D32F2F')
+        self.record_btn.bind('<Enter>', lambda e: self.record_btn.configure(bg='#D32F2F'))
+        self.record_btn.bind('<Leave>', lambda e: self.record_btn.configure(bg=self.ds.COLORS['error']))
+        self._update_recording_time()
+        self.status_text.config(text=f'正在录音 · ASR: {self._engine_label()}  ·  翻译: MiMo')
 
     def _stop_recording(self):
         self.is_recording = False
@@ -387,44 +447,74 @@ class LecTransApp:
         if self.recognizer:
             self.recognizer.stop_continuous_recognition()
 
-        # 停止录音并获取音频数据
-        audio_data = b''
+        audio_info = {'path': '', 'duration': 0.0, 'bytes': 0}
         if self.audio_recorder:
-            audio_data = self.audio_recorder.stop()
+            audio_info = self.audio_recorder.stop()
             self.audio_recorder = None
 
-        end_time = datetime.now()
+        # 通知翻译线程收尾；队列满时丢弃最旧一条确保哨兵送达
+        try:
+            self.translation_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self.translation_queue.get_nowait()
+                self.translation_queue.put_nowait(None)
+            except (queue.Empty, queue.Full):
+                logger.warning("翻译队列繁忙，worker 将在超时后回收")
 
         self.record_btn.configure(
             text='● 开始录音',
             bg=self.ds.COLORS['success'],
             activebackground='#28B84C')
-        # 恢复 hover 绑定
         self.record_btn.bind('<Enter>', lambda e: self.record_btn.configure(bg='#28B84C'))
         self.record_btn.bind('<Leave>', lambda e: self.record_btn.configure(bg=self.ds.COLORS['success']))
         self.recording_time_label.config(text='')
+        self.status_text.config(text='正在保存录音与笔记…')
 
-        # 自动保存会话
-        if self.session_id:
-            recording_path = ""
+        self._finalizing = True
+        token = self.session_token
+        threading.Thread(
+            target=self._finalize_worker, args=(token, audio_info), daemon=True).start()
 
-            # 默认直接保存录音为 mp3
-            if audio_data and len(audio_data) > 0:
-                RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-                recording_path = str(RECORDINGS_DIR / f"{self.session_id}.mp3")
-                AudioRecorder.save_mp3(recording_path, audio_data, self.config.sample_rate)
+    def _finalize_worker(self, token: int, audio_info: dict):
+        """等待翻译线程收尾，然后把会话保存交给主线程"""
+        worker = self.translation_thread
+        if worker and worker.is_alive():
+            worker.join(timeout=60)
+        self.translation_thread = None
+        self.msg_queue.put(('finalize', {
+            'token': token,
+            'audio': audio_info,
+        }))
 
-            # 只有当有内容或有录音时才保存会话
-            if self.transcripts or recording_path:
-                self.session_mgr.save_session(
-                    session_id=self.session_id,
-                    transcripts=self.transcripts,
-                    summary=self.summary,
-                    recording_path=recording_path,
-                    start_time=self.recording_start_time,
-                    end_time=end_time,
-                )
-                messagebox.showinfo('自动保存', '录音与会话已自动保存到历史记录')
+    def _finalize_session(self, data: dict):
+        """主线程：转换录音、保存会话"""
+        self._finalizing = False
+        if data.get('token') != self.session_token:
+            return
+
+        audio = data.get('audio') or {}
+        wav_path = audio.get('path', '')
+        final_path = ''
+        if wav_path:
+            mp3_path = str(RECORDINGS_DIR / f"{self.session_id}.mp3")
+            final_path = AudioRecorder.convert_wav_to_mp3(wav_path, mp3_path)
+
+        end_time = datetime.now()
+        if self.session_id and (self.transcripts or final_path):
+            self.session_mgr.save_session(
+                session_id=self.session_id,
+                transcripts=self.transcripts,
+                summary=self.summary,
+                recording_path=final_path,
+                start_time=self.recording_start_time,
+                end_time=end_time,
+            )
+            logger.info("会话已保存: %s (%d 条, 录音=%s)", self.session_id, len(self.transcripts), bool(final_path))
+            self.status_text.config(text='已自动保存到历史记录')
+            self.root.after(4000, lambda: self.status_text.config(text=self._status_text()))
+        else:
+            self.status_text.config(text=self._status_text())
 
         self.recording_start_time = None
 
@@ -432,13 +522,41 @@ class LecTransApp:
     # 回调
     # ==============================================================
 
+    def _start_translation_worker(self, token: int):
+        """启动翻译 worker：消费韩语文本，携带滚动上下文调用 MiMo"""
+        self.translation_queue = queue.Queue(maxsize=64)
+
+        def worker():
+            context = []
+            context_size = max(0, int(self.config.translation_context_size))
+            while True:
+                korean = self.translation_queue.get()
+                if korean is None:
+                    break
+                if token != self.session_token:
+                    continue
+                chinese = self.mimo_client.translate(
+                    korean, self.config.llm_model, context=context)
+                if token != self.session_token:
+                    continue
+                context.append([korean, chinese])
+                if context_size and len(context) > context_size:
+                    context = context[-context_size:]
+                self.msg_queue.put(('transcript', {'korean': korean, 'chinese': chinese}))
+
+        self.translation_thread = threading.Thread(
+            target=worker, name="translation-worker", daemon=True)
+        self.translation_thread.start()
+
     def _on_recognized(self, result):
-        """识别结果回调（运行在后台线程）"""
+        """识别结果回调（运行在识别线程）：仅入队，避免阻塞识别"""
         korean = result.text
         if not korean or len(korean.strip()) < 2:
             return
-        chinese = self.mimo_client.translate(korean, self.config.llm_model)
-        self.msg_queue.put(('transcript', {'korean': korean, 'chinese': chinese}))
+        try:
+            self.translation_queue.put(korean, timeout=5)
+        except queue.Full:
+            logger.warning("翻译队列已满，丢弃识别结果: %s…", korean[:20])
 
     def _on_error(self, error):
         self.msg_queue.put(('error', f'识别错误: {error}'))
@@ -450,8 +568,7 @@ class LecTransApp:
     def _update_recording_time(self):
         if self.is_recording and self.recording_start_time:
             elapsed = datetime.now() - self.recording_start_time
-            seconds = int(elapsed.total_seconds())
-            m, s = divmod(seconds, 60)
+            m, s = divmod(int(elapsed.total_seconds()), 60)
             self.recording_time_label.config(text=f'{m:02d}:{s:02d}')
             self.root.after(1000, self._update_recording_time)
 
@@ -513,11 +630,12 @@ class LecTransApp:
             try:
                 transcript = '\n'.join([
                     f'[{e.timestamp.strftime("%H:%M:%S")}] {e.korean}'
-                    for e in self.transcripts
+                    for e in list(self.transcripts)
                 ])
-                self.summary = self.mimo_client.summarize(transcript, self.config.llm_model)
-                self.root.after(0, lambda: self._show_summary(self.summary))
+                summary = self.mimo_client.summarize(transcript, self.config.llm_model)
+                self.root.after(0, lambda: self._show_summary(summary))
             except Exception:
+                logger.exception("生成总结失败")
                 self.root.after(0, lambda: messagebox.showerror('错误', '生成失败'))
             finally:
                 self.root.after(0, progress.destroy)
@@ -532,12 +650,10 @@ class LecTransApp:
         win.geometry('580x480')
         win.configure(bg=c['bg_primary'])
 
-        # 标题
         header = Frame(win, bg=c['bg_primary'])
         header.pack(fill=X, padx=24, pady=(24, 16))
         self.ds.make_label(header, '课堂总结', style='title').pack(side=LEFT)
 
-        # 内容
         text_card = self.ds.make_card(win)
         text_card.pack(fill=BOTH, expand=True, padx=24, pady=(0, 16))
 
@@ -548,7 +664,6 @@ class LecTransApp:
         text.pack(fill=BOTH, expand=True, padx=1, pady=1)
         text.insert(1.0, summary)
 
-        # 按钮组
         btn_frame = Frame(win, bg=c['bg_primary'])
         btn_frame.pack(fill=X, padx=24, pady=(0, 24))
 
@@ -566,7 +681,7 @@ class LecTransApp:
 
     def _save_summary(self, summary):
         fp = filedialog.asksaveasfilename(defaultextension='.md',
-                                           filetypes=[('Markdown', '*.md')])
+                                          filetypes=[('Markdown', '*.md')])
         if fp:
             with open(fp, 'w', encoding='utf-8') as f:
                 f.write(summary)
@@ -586,37 +701,25 @@ class LecTransApp:
             filetypes=[('Markdown', '*.md')],
             initialfile=f'session_{datetime.now().strftime("%Y%m%d_%H%M%S")}.md',
         )
-        if fp:
-            lines = [
-                f'# LecTrans 课堂笔记\n\n',
-                f'**日期**: {datetime.now().strftime("%Y-%m-%d %H:%M")}\n\n',
-                '---\n\n',
-            ]
-            for e in self.transcripts:
-                lines.append(
-                    f'### [{e.timestamp.strftime("%H:%M:%S")}]\n'
-                    f'**韩语**: {e.korean}\n\n'
-                    f'**中文**: {e.chinese}\n\n---\n\n'
-                )
-            if self.summary:
-                lines.append(f'\n## 总结\n\n{self.summary}')
-            with open(fp, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            messagebox.showinfo('成功', '已保存')
+        if not fp:
+            return
 
-    # ==============================================================
-    # 状态
-    # ==============================================================
-
-    def _update_status(self, connected):
-        self.is_connected = connected
-        c = self.ds.COLORS
-        if connected:
-            self.status_dot.config(fg=c['success'])
-            self.status_text.config(text='ASR: Azure  ·  翻译: MiMo')
-        else:
-            self.status_dot.config(fg=c['error'])
-            self.status_text.config(text='ASR: Azure  ·  翻译: 未连接')
+        lines = [
+            '# LecTrans 课堂笔记\n\n',
+            f'**日期**: {datetime.now().strftime("%Y-%m-%d %H:%M")}\n\n',
+            '---\n\n',
+        ]
+        for e in self.transcripts:
+            lines.append(
+                f'### [{e.timestamp.strftime("%H:%M:%S")}]\n'
+                f'**韩语**: {e.korean}\n\n'
+                f'**中文**: {e.chinese}\n\n---\n\n'
+            )
+        if self.summary:
+            lines.append(f'\n## 总结\n\n{self.summary}')
+        with open(fp, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        messagebox.showinfo('成功', '已保存')
 
     # ==============================================================
     # 运行
