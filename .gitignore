@@ -22,6 +22,7 @@ wheels/
 
 # Virtual Environment
 venv/
+.venv/
 env/
 ENV/
 
@@ -44,7 +45,7 @@ logs/
 Thumbs.db
 
 # PyInstaller
-*.spec
+# 注意：LecTrans.spec 是构建配置，需要纳入版本控制
 *.exe
 *.dll
 

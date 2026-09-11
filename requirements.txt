@@ -1,21 +1,20 @@
-# LecTrans - 实时课堂翻译工具
-# Requirements
+# LecTrans - 运行时依赖
 
-# 音频处理
+# 音频采集与处理
 pyaudio==0.2.14
-webrtcvad==2.0.10
 numpy==1.26.4
+pydub==0.25.1
 
-# API 客户端
-openai==1.50.0
-groq==0.11.0
-httpx==0.27.0
+# 本地语音识别（ASR: local）
+faster-whisper==1.2.1
+
+# 云端语音识别（ASR: azure）
 azure-cognitiveservices-speech>=1.49.0
 
-# 前端
-streamlit==1.39.0
+# MiMo（OpenAI 兼容接口）与 HTTP
+openai==1.50.0
+httpx==0.27.0
 
-# 工具
-pyyaml==6.0.2
+# 配置、密钥与环境变量
 python-dotenv==1.0.1
-rich==13.9.0
+keyring>=25.0.0

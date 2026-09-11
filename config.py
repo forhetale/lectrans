@@ -1,144 +1,210 @@
 """
 LecTrans 配置管理模块
+
+- 基于 JSON 存储（~/.lectrans/config.json），支持 LECTRANS_HOME 覆盖目录
+- 支持环境变量覆盖（方便部署与测试）
+- API Key 优先使用系统 keyring 保存，不可用时回退到 JSON（并尽力限制文件权限）
+- 支持 Azure + MiMo 双 API 配置
 """
 
+import json
+import logging
 import os
-from dataclasses import dataclass, field
-from typing import Optional
+import stat
 from pathlib import Path
-import yaml
-from dotenv import load_dotenv
 
-# 加载环境变量
-load_dotenv()
+logger = logging.getLogger(__name__)
 
+APP_VERSION = "0.2.0"
+APP_NAME = "LecTrans"
 
-@dataclass
-class APIConfig:
-    """API 配置"""
-    # ASR 配置
-    asr_provider: str = "groq"  # groq, openai, azure, local
-    asr_api_key: str = ""
-    asr_model: str = "whisper-large-v3-turbo"
-    
-    # Azure配置
-    azure_subscription_key: str = ""
-    azure_region: str = "koreacentral"
-    azure_endpoint: str = ""
-    azure_language: str = "ko-KR"
-    
-    # LLM 配置
-    llm_provider: str = "xiaomi"  # xiaomi, deepseek, openai, groq, local
-    llm_api_key: str = ""
-    llm_base_url: str = "https://token-plan-cn.xiaomimimo.com/v1"
-    llm_model: str = "mimo-v2.5-pro"
-    
-    def __post_init__(self):
-        """从环境变量加载"""
-        self.asr_api_key = self.asr_api_key or os.getenv("GROQ_API_KEY", "")
-        self.llm_api_key = self.llm_api_key or os.getenv("XIAOMI_API_KEY", "")
-        
-        # Azure配置
-        self.azure_subscription_key = self.azure_subscription_key or os.getenv("AZURE_SPEECH_KEY", "")
-        self.azure_region = self.azure_region or os.getenv("AZURE_SPEECH_REGION", "koreacentral")
-        self.azure_endpoint = self.azure_endpoint or os.getenv("AZURE_SPEECH_ENDPOINT", "")
-        
-        # 根据 provider 自动设置 base_url
-        if not self.llm_base_url:
-            if self.llm_provider == "xiaomi":
-                self.llm_base_url = os.getenv("XIAOMI_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")
-            elif self.llm_provider == "deepseek":
-                self.llm_base_url = "https://api.deepseek.com/v1"
-    
-    @property
-    def is_configured(self) -> bool:
-        """检查是否已配置"""
-        if self.asr_provider == "azure":
-            return bool(self.azure_subscription_key)
-        return bool(self.asr_api_key and self.llm_api_key)
+_KEYRING_SERVICE = "lectrans"
+_KEYRING_ALIASES = {"azure_key": "azure_speech_key", "api_key": "mimo_api_key"}
 
 
-@dataclass
-class AudioConfig:
-    """音频配置"""
-    sample_rate: int = 16000
-    chunk_size: int = 1024
-    channels: int = 1
-    buffer_duration: float = 3.0  # 缓冲区时长（秒）
-    vad_mode: int = 2  # VAD 模式 (0-3, 越大越敏感)
+def _base_dir() -> Path:
+    override = os.environ.get("LECTRANS_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".lectrans"
 
 
-@dataclass
-class UIConfig:
-    """UI 配置"""
-    theme: str = "dark"
-    font_size: int = 16
-    show_timestamp: bool = True
-    auto_scroll: bool = True
+CONFIG_DIR = _base_dir()
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+RECORDINGS_DIR = CONFIG_DIR / "recordings"
+LOG_FILE = CONFIG_DIR / "lectrans.log"
 
 
-@dataclass
+def _keyring_module():
+    """惰性获取 keyring 模块，未安装时返回 None"""
+    try:
+        import keyring  # type: ignore
+
+        return keyring
+    except Exception:
+        return None
+
+
+def _save_secret(name: str, value: str) -> bool:
+    """将密钥写入系统钥匙串，失败返回 False"""
+    if not value:
+        return False
+    keyring = _keyring_module()
+    if keyring is None:
+        return False
+    try:
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_ALIASES.get(name, name), value)
+        return True
+    except Exception as e:
+        logger.warning("keyring 写入失败(%s)，将回退到配置文件: %s", name, e)
+        return False
+
+
+def _load_secret(name: str) -> str:
+    """从系统钥匙串读取密钥，失败返回空串"""
+    keyring = _keyring_module()
+    if keyring is None:
+        return ""
+    try:
+        return keyring.get_password(_KEYRING_SERVICE, _KEYRING_ALIASES.get(name, name)) or ""
+    except Exception:
+        return ""
+
+
 class AppConfig:
     """应用配置"""
-    api: APIConfig = field(default_factory=APIConfig)
-    audio: AudioConfig = field(default_factory=AudioConfig)
-    ui: UIConfig = field(default_factory=UIConfig)
-    
-    # 文件路径
-    config_dir: Path = Path.home() / ".lectrans"
-    config_file: Path = config_dir / "config.yaml"
-    
+
+    def __init__(self):
+        # 语音识别引擎选择: "local" 或 "azure"
+        self.asr_engine = "local"
+        self.whisper_model = "base"
+
+        # Azure 语音识别
+        self.azure_key = ""
+        self.azure_region = "koreacentral"
+        self.azure_language = "ko-KR"
+
+        # MiMo 翻译/总结
+        self.api_key = ""
+        self.base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+        self.llm_model = "mimo-v2.5-pro"
+        self.api_timeout = 30
+
+        # 音频
+        self.audio_device_index = -1
+        self.sample_rate = 16000
+
+        # 本地 VAD 调优
+        self.energy_threshold = 300        # 噪声门限（RMS 基准值）
+        self.silence_duration = 0.8        # 判定句子结束的静音时长（秒）
+        self.max_utterance_seconds = 20.0  # 单句最长时长（秒），超出强制切分
+
+        # 翻译上下文
+        self.translation_context_size = 5  # 携带最近 N 条双语对照作为上下文
+
+        # UI
+        self.font_size = 13
+
+        # 从文件加载（覆盖默认值）
+        self.load()
+
+    # ------------------------------------------------------ 加载 / 保存
+
     def load(self):
-        """加载配置"""
-        if self.config_file.exists():
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-                
-                # API 配置
-                api_data = data.get('api', {})
-                self.api.asr_provider = api_data.get('asr_provider', self.api.asr_provider)
-                self.api.asr_api_key = api_data.get('asr_api_key', self.api.asr_api_key)
-                self.api.llm_provider = api_data.get('llm_provider', self.api.llm_provider)
-                self.api.llm_api_key = api_data.get('llm_api_key', self.api.llm_api_key)
-                self.api.llm_base_url = api_data.get('llm_base_url', self.api.llm_base_url)
-                self.api.llm_model = api_data.get('llm_model', self.api.llm_model)
-                
-                # Azure配置
-                azure_data = api_data.get('azure', {})
-                self.api.azure_subscription_key = azure_data.get('subscription_key', self.api.azure_subscription_key)
-                self.api.azure_region = azure_data.get('region', self.api.azure_region)
-                self.api.azure_endpoint = azure_data.get('endpoint', self.api.azure_endpoint)
-                self.api.azure_language = azure_data.get('language', self.api.azure_language)
-                
-                # UI 配置
-                ui_data = data.get('ui', {})
-                self.ui.theme = ui_data.get('theme', self.ui.theme)
-                self.ui.font_size = ui_data.get('font_size', self.ui.font_size)
-    
-    def save(self):
-        """保存配置"""
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        
-        data = {
-            'api': {
-                'asr_provider': self.api.asr_provider,
-                'asr_api_key': self.api.asr_api_key,
-                'azure': {
-                    'subscription_key': self.api.azure_subscription_key,
-                    'region': self.api.azure_region,
-                    'endpoint': self.api.azure_endpoint,
-                    'language': self.api.azure_language,
-                },
-                'llm_provider': self.api.llm_provider,
-                'llm_api_key': self.api.llm_api_key,
-                'llm_base_url': self.api.llm_base_url,
-                'llm_model': self.api.llm_model,
-            },
-            'ui': {
-                'theme': self.ui.theme,
-                'font_size': self.ui.font_size,
-            }
+        """加载配置：JSON -> keyring -> 环境变量覆盖"""
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for key, value in data.items():
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+            except Exception as e:
+                logger.warning("读取配置文件失败: %s", e)
+
+        for attr in ("azure_key", "api_key"):
+            if not getattr(self, attr):
+                secret = _load_secret(attr)
+                if secret:
+                    setattr(self, attr, secret)
+
+        self._load_env()
+
+    def _load_env(self):
+        """环境变量覆盖（部署与 CI 场景）"""
+        env_map = {
+            "LECTRANS_ASR_ENGINE": "asr_engine",
+            "LECTRANS_WHISPER_MODEL": "whisper_model",
+            "LECTRANS_AZURE_KEY": "azure_key",
+            "LECTRANS_AZURE_REGION": "azure_region",
+            "LECTRANS_AZURE_LANGUAGE": "azure_language",
+            "LECTRANS_API_KEY": "api_key",
+            "LECTRANS_BASE_URL": "base_url",
+            "LECTRANS_LLM_MODEL": "llm_model",
+            "LECTRANS_AUDIO_DEVICE_INDEX": "audio_device_index",
+            "LECTRANS_FONT_SIZE": "font_size",
         }
-        
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(data, f, allow_unicode=True)
+        int_attrs = {"audio_device_index", "font_size"}
+        for env_name, attr in env_map.items():
+            value = os.environ.get(env_name, "").strip()
+            if not value:
+                continue
+            try:
+                setattr(self, attr, int(value) if attr in int_attrs else value)
+            except ValueError:
+                logger.warning("环境变量 %s 取值非法: %r", env_name, value)
+
+    def save(self):
+        """保存配置到 JSON 文件；密钥优先写入系统钥匙串"""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+        azure_key = self.azure_key
+        api_key = self.api_key
+        if _save_secret("azure_key", azure_key):
+            azure_key = ""
+        if _save_secret("api_key", api_key):
+            api_key = ""
+
+        data = {
+            "version": APP_VERSION,
+            "asr_engine": self.asr_engine,
+            "whisper_model": self.whisper_model,
+            "azure_key": azure_key,
+            "azure_region": self.azure_region,
+            "azure_language": self.azure_language,
+            "api_key": api_key,
+            "base_url": self.base_url,
+            "llm_model": self.llm_model,
+            "api_timeout": self.api_timeout,
+            "audio_device_index": self.audio_device_index,
+            "sample_rate": self.sample_rate,
+            "energy_threshold": self.energy_threshold,
+            "silence_duration": self.silence_duration,
+            "max_utterance_seconds": self.max_utterance_seconds,
+            "translation_context_size": self.translation_context_size,
+            "font_size": self.font_size,
+        }
+
+        tmp_file = CONFIG_FILE.with_suffix(".json.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, CONFIG_FILE)
+
+        self._restrict_permissions(CONFIG_FILE)
+
+    @staticmethod
+    def _restrict_permissions(path: Path):
+        """尽量将配置文件限制为仅当前用户可读（POSIX）"""
+        try:
+            if os.name == "posix":
+                path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+
+    @property
+    def is_configured(self) -> bool:
+        """检查是否已配置必要的 API Key"""
+        if self.asr_engine == "azure":
+            return bool(self.azure_key and self.api_key)
+        return bool(self.api_key)

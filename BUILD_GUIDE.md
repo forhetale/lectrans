@@ -1,120 +1,64 @@
-# LecTrans Windows 打包指南
+# LecTrans 构建与打包指南
 
-## 方法一：在 Windows 上本地打包（推荐）
+## 方式一：源码运行（推荐，功能完整）
 
-### 前提条件
-- Windows 10/11
-- Python 3.9+ 已安装
-- 网络连接
+适用于开发与需要**本地 faster-whisper 离线识别**的场景。
 
-### 步骤
+```bash
+# 1. 创建虚拟环境（Python 3.11+）
+python -m venv .venv
+.venv\Scripts\activate            # Windows
+# source .venv/bin/activate       # macOS / Linux
 
-#### 1. 下载项目
-将整个 `lectrans` 文件夹复制到 Windows 电脑
+# 2. 安装依赖
+pip install -r requirements.txt
 
-#### 2. 运行打包脚本
-双击 `build_windows.bat`，等待完成
-
-#### 3. 获取 exe
-打包完成后，`dist\LecTrans.exe` 就是可执行文件
-
----
-
-## 方法二：使用 GitHub Actions 自动打包
-
-如果有 GitHub 账号，可以使用以下工作流自动打包：
-
-### 1. 创建 GitHub 仓库
-上传项目到 GitHub
-
-### 2. 添加工作流
-创建 `.github/workflows/build.yml`：
-
-```yaml
-name: Build LecTrans
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
-    
-    - name: Build exe
-      run: |
-        pyinstaller --onefile --windowed --name LecTrans ^
-          --hidden-import openai ^
-          --hidden-import groq ^
-          --hidden-import httpx ^
-          --hidden-import pydantic ^
-          --hidden-import pydantic_core ^
-          --hidden-import anyio ^
-          --hidden-import sniffio ^
-          --hidden-import distro ^
-          --hidden-import jiter ^
-          --hidden-import h11 ^
-          gui_app.py
-    
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: LecTrans
-        path: dist/LecTrans.exe
+# 3. 运行
+python main.py
 ```
 
-### 3. 下载 exe
-在 Actions 页面下载打包好的 exe 文件
+首次使用本地引擎时会自动下载 Whisper 模型（`tiny`/`base`/`small`…，越大越准也越慢）。
 
----
+## 方式二：打包 Windows EXE
 
-## 方法三：使用在线打包服务
+```bat
+build.bat
+```
 
-### PyInstaller Online
-https://www.pyinstaller.org/
+脚本会安装依赖并调用 [LecTrans.spec](LecTrans.spec) 生成 **`dist\LecTrans.exe`**（约 90-120MB）。
 
-### Nuitka
-https://nuitka.net/
+> ⚠️ exe 内置 **Azure Speech** 引擎。
+> 本地 faster-whisper 因依赖体积过大（ctranslate2 / tokenizers / onnxruntime 等）未打包，
+> 如需离线识别请使用方式一源码运行。
 
----
+## 方式三：GitHub Actions 云端构建
+
+仓库内置 `.github/workflows/ci.yml`：
+
+- `push / PR`：在 Windows 上运行单元测试、编译检查与 ruff
+- `workflow_dispatch`（手动触发）：执行 PyInstaller 构建并上传 `LecTrans-windows` 产物
+
+## spec 说明（可移植）
+
+`LecTrans.spec` 已移除旧版的硬编码绝对路径：
+
+- `collect_all("azure.cognitiveservices.speech")` 自动收集 SDK 原生 DLL
+- `collect_submodules("openai")` / `collect_submodules("keyring.backends")` 自动收集隐藏导入
+- `excludes` 排除 numpy / faster_whisper 等本地引擎依赖以控制体积
 
 ## 常见问题
 
-### Q: 打包后 exe 很大？
-A: 正常，Python 运行时和依赖都会打包进去，通常 30-50MB
+**Q: 打包后 exe 很大？**
+A: 正常。Python 运行时 + Azure SDK + OpenAI SDK 都在其中。
 
-### Q: 杀毒软件报警？
-A: PyInstaller 打包的程序可能被误报，添加白名单即可
+**Q: 杀毒软件报警？**
+A: PyInstaller onefile 常见误报，添加白名单即可。
 
-### Q: 运行时缺少 DLL？
-A: 确保在 Windows 上打包，不要跨平台打包
+**Q: exe 启动后提示无法使用本地识别？**
+A: 在「设置」中把引擎切换为 **azure**，或改用源码方式运行。
 
-### Q: 如何减小体积？
-A: 使用 UPX 压缩：https://upx.github.io/
+**Q: 打包失败提示找不到 Azure DLL？**
+A: 确认已安装 `azure-cognitiveservices-speech`，spec 会自动定位；无需手动配置路径。
 
----
-
-## 快速打包命令（Windows CMD）
-
-```cmd
-cd lectrans
-pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --windowed --name LecTrans gui_app.py
-```
-
-打包完成后，`dist\LecTrans.exe` 就是可执行文件
+**Q: 如何减小体积？**
+A: 保持 spec 中的 `excludes`；如需 UPX 压缩请自行安装并确认不再使用 `upx=True` 的兼容性问题。
